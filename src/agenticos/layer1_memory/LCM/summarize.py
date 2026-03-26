@@ -1,0 +1,409 @@
+"""
+LCM Summarization — LLM-based summarization with depth-aware prompts.
+
+Supports 4 prompt templates: leaf (normal/aggressive), D1, D2, D3+.
+Includes provider auth error detection and deterministic fallback.
+
+Ported from summarize.ts.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import re
+from dataclasses import dataclass
+from typing import Any
+
+from .types import CompleteFn, CompletionResult
+
+logger = logging.getLogger("lcm.summarize")
+
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+DEFAULT_CONDENSED_TARGET_TOKENS = 2_000
+SUMMARIZER_TIMEOUT_S = 60.0
+SYSTEM_PROMPT = (
+    "You are a context-compaction summarization engine. "
+    "Follow user instructions exactly and return plain text summary content only."
+)
+
+AUTH_ERROR_PATTERN = re.compile(
+    r"\b401\b|unauthorized|unauthorised|invalid[_ -]?token"
+    r"|invalid[_ -]?api[_ -]?key|authentication failed"
+    r"|authorization failed|missing scope|insufficient scope"
+    r"|model\.request\b",
+    re.IGNORECASE,
+)
+
+
+# ── Exceptions ────────────────────────────────────────────────────────────────
+
+
+class LcmProviderAuthError(Exception):
+    """Raised when the summarizer hits a provider auth failure."""
+
+    def __init__(self, provider: str, model: str, message: str = ""):
+        super().__init__(
+            f"[lcm] compaction failed: provider auth error. "
+            f"Check configured summaryProvider credentials. "
+            f"Current: {provider}/{model}. {message}"
+        )
+        self.provider = provider
+        self.model = model
+
+
+class SummarizerTimeoutError(Exception):
+    """Raised when a summarization call exceeds the timeout."""
+
+    def __init__(self, timeout_s: float, label: str):
+        super().__init__(f"[lcm] summarizer timeout after {timeout_s}s ({label})")
+
+
+# ── Token estimation ──────────────────────────────────────────────────────────
+
+
+def estimate_tokens_fallback(text: str) -> int:
+    """Rough fallback estimate (~4 chars/token). Use real tokenizer when available."""
+    return math.ceil(len(text) / 4)
+
+
+def resolve_target_tokens(
+    input_tokens: int,
+    aggressive: bool = False,
+    is_condensed: bool = False,
+    condensed_target: int = DEFAULT_CONDENSED_TARGET_TOKENS,
+) -> int:
+    """Calculate target summary token count based on input and mode."""
+    if is_condensed:
+        return max(512, condensed_target)
+    if aggressive:
+        return max(96, min(640, int(input_tokens * 0.2)))
+    return max(192, min(1200, int(input_tokens * 0.35)))
+
+
+# ── Prompt Builders ───────────────────────────────────────────────────────────
+
+
+def build_leaf_prompt(
+    text: str,
+    target_tokens: int,
+    aggressive: bool = False,
+    previous_summary: str | None = None,
+    custom_instructions: str | None = None,
+) -> str:
+    """Build leaf-level segment summarization prompt."""
+    prev_ctx = (previous_summary or "").strip() or "(none)"
+    instr = f"Operator instructions:\n{custom_instructions.strip()}" if custom_instructions and custom_instructions.strip() else "Operator instructions: (none)"
+
+    policy = (
+        "Aggressive summary policy:\n"
+        "- Keep only durable facts and current task state.\n"
+        "- Remove examples, repetition, and low-value narrative details.\n"
+        "- Preserve explicit TODOs, blockers, decisions, and constraints."
+    ) if aggressive else (
+        "Normal summary policy:\n"
+        "- Preserve key decisions, rationale, constraints, and active tasks.\n"
+        "- Keep essential technical details needed to continue work safely.\n"
+        "- Remove obvious repetition and conversational filler."
+    )
+
+    return "\n\n".join([
+        "You summarize a SEGMENT of a conversation for future model turns.",
+        "Treat this as incremental memory compaction input, not a full-conversation summary.",
+        policy,
+        instr,
+        (
+            "Output requirements:\n"
+            "- Plain text only.\n"
+            "- No preamble, headings, or markdown formatting.\n"
+            "- Keep it concise while preserving required details.\n"
+            "- Track file operations (created, modified, deleted, renamed) with file paths and current status.\n"
+            '- If no file operations appear, include exactly: "Files: none".\n'
+            '- End with exactly: "Expand for details about: <comma-separated list of what was dropped or compressed>".\n'
+            f"- Target length: about {target_tokens} tokens or less."
+        ),
+        f"<previous_context>\n{prev_ctx}\n</previous_context>",
+        f"<conversation_segment>\n{text}\n</conversation_segment>",
+    ])
+
+
+def build_d1_prompt(
+    text: str,
+    target_tokens: int,
+    previous_summary: str | None = None,
+    custom_instructions: str | None = None,
+) -> str:
+    """Build D1 condensation prompt (session → condensed)."""
+    instr = f"Operator instructions:\n{custom_instructions.strip()}" if custom_instructions and custom_instructions.strip() else "Operator instructions: (none)"
+    prev_ctx = (previous_summary or "").strip()
+    prev_block = (
+        "It already has this preceding summary as context. Do not repeat information\n"
+        "that appears there unchanged. Focus on what is new, changed, or resolved:\n\n"
+        f"<previous_context>\n{prev_ctx}\n</previous_context>"
+    ) if prev_ctx else "Focus on what matters for continuation:"
+
+    return "\n\n".join([
+        "You are compacting leaf-level conversation summaries into a single condensed memory node.",
+        "You are preparing context for a fresh model instance that will continue this conversation.",
+        instr,
+        prev_block,
+        (
+            "Preserve:\n"
+            "- Decisions made and their rationale when rationale matters going forward.\n"
+            "- Earlier decisions that were superseded, and what replaced them.\n"
+            "- Completed tasks/topics with outcomes.\n"
+            "- In-progress items with current state and what remains.\n"
+            "- Blockers, open questions, and unresolved tensions.\n"
+            "- Specific references (names, paths, URLs, identifiers) needed for continuation.\n\n"
+            "Drop low-value detail:\n"
+            "- Context that has not changed from previous_context.\n"
+            "- Intermediate dead ends where the conclusion is already known.\n"
+            "- Transient states that are already resolved.\n"
+            "- Tool-internal mechanics and process scaffolding.\n\n"
+            "Use plain text. No mandatory structure.\n"
+            "Include a timeline with timestamps (hour or half-hour) for significant events.\n"
+            "Present information chronologically and mark superseded decisions.\n"
+            '- End with exactly: "Expand for details about: <comma-separated list>".\n'
+            f"Target length: about {target_tokens} tokens."
+        ),
+        f"<conversation_to_condense>\n{text}\n</conversation_to_condense>",
+    ])
+
+
+def build_d2_prompt(
+    text: str,
+    target_tokens: int,
+    custom_instructions: str | None = None,
+) -> str:
+    """Build D2 condensation prompt (session-level → phase-level)."""
+    instr = f"Operator instructions:\n{custom_instructions.strip()}" if custom_instructions and custom_instructions.strip() else "Operator instructions: (none)"
+
+    return "\n\n".join([
+        "You are condensing multiple session-level summaries into a higher-level memory node.",
+        "A future model should understand trajectory, not per-session minutiae.",
+        instr,
+        (
+            "Preserve:\n"
+            "- Decisions still in effect and their rationale.\n"
+            "- Decisions that evolved: what changed and why.\n"
+            "- Completed work with outcomes.\n"
+            "- Active constraints, limitations, and known issues.\n"
+            "- Current state of in-progress work.\n\n"
+            "Drop:\n"
+            "- Session-local operational detail and process mechanics.\n"
+            "- Identifiers that are no longer relevant.\n"
+            "- Intermediate states superseded by later outcomes.\n\n"
+            "Use plain text. Brief headers are fine if useful.\n"
+            "Include a timeline with dates and approximate time of day for key milestones.\n"
+            '- End with exactly: "Expand for details about: <comma-separated list>".\n'
+            f"Target length: about {target_tokens} tokens."
+        ),
+        f"<conversation_to_condense>\n{text}\n</conversation_to_condense>",
+    ])
+
+
+def build_d3plus_prompt(
+    text: str,
+    target_tokens: int,
+    custom_instructions: str | None = None,
+) -> str:
+    """Build D3+ condensation prompt (phase-level → durable memory)."""
+    instr = f"Operator instructions:\n{custom_instructions.strip()}" if custom_instructions and custom_instructions.strip() else "Operator instructions: (none)"
+
+    return "\n\n".join([
+        "You are creating a high-level memory node from multiple phase-level summaries.",
+        "This may persist for the rest of the conversation. Keep only durable context.",
+        instr,
+        (
+            "Preserve:\n"
+            "- Key decisions and rationale.\n"
+            "- What was accomplished and current state.\n"
+            "- Active constraints and hard limitations.\n"
+            "- Important relationships between people, systems, or concepts.\n"
+            "- Durable lessons learned.\n\n"
+            "Drop:\n"
+            "- Operational and process detail.\n"
+            "- Method details unless the method itself was the decision.\n"
+            "- Specific references unless essential for continuation.\n\n"
+            "Use plain text. Be concise.\n"
+            "Include a brief timeline with dates (or date ranges) for major milestones.\n"
+            '- End with exactly: "Expand for details about: <comma-separated list>".\n'
+            f"Target length: about {target_tokens} tokens."
+        ),
+        f"<conversation_to_condense>\n{text}\n</conversation_to_condense>",
+    ])
+
+
+def build_condensed_prompt(
+    text: str,
+    target_tokens: int,
+    depth: int,
+    previous_summary: str | None = None,
+    custom_instructions: str | None = None,
+) -> str:
+    """Select prompt template based on depth."""
+    if depth <= 1:
+        return build_d1_prompt(text, target_tokens, previous_summary, custom_instructions)
+    if depth == 2:
+        return build_d2_prompt(text, target_tokens, custom_instructions)
+    return build_d3plus_prompt(text, target_tokens, custom_instructions)
+
+
+# ── Deterministic Fallback ────────────────────────────────────────────────────
+
+
+def deterministic_fallback_summary(text: str, max_tokens: int = 512) -> str:
+    """
+    Deterministic truncation fallback when LLM output is empty.
+
+    Takes ~max_tokens * 4 characters from the end of the input,
+    prefixed with a marker indicating truncation.
+    """
+    max_chars = max_tokens * 4
+    if len(text) <= max_chars:
+        return text.strip()
+    return f"[Truncated — oldest context removed]\n\n{text[-max_chars:].strip()}"
+
+
+# ── Response Normalization ────────────────────────────────────────────────────
+
+
+def normalize_completion_summary(content: Any) -> str:
+    """Extract text from provider completion response content."""
+    chunks: list[str] = []
+    _collect_text(content, chunks)
+    # Deduplicate exact fragments
+    seen: set[str] = set()
+    unique: list[str] = []
+    for chunk in chunks:
+        trimmed = chunk.strip()
+        if trimmed and trimmed not in seen:
+            seen.add(trimmed)
+            unique.append(trimmed)
+    return "\n".join(unique).strip()
+
+
+def _collect_text(value: Any, out: list[str]) -> None:
+    """Recursively collect text fields from provider response."""
+    if isinstance(value, str):
+        out.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_text(item, out)
+        return
+    if not isinstance(value, dict):
+        return
+    for key in ("text", "output_text", "thinking"):
+        v = value.get(key)
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, list):
+            for item in v:
+                _collect_text(item, out)
+    for key in ("content", "summary", "output", "message", "response"):
+        if key in value:
+            _collect_text(value[key], out)
+
+
+def detect_provider_auth_failure(error: Any) -> bool:
+    """Check if an error looks like a provider auth failure."""
+    text_parts: list[str] = []
+    _collect_text(error if isinstance(error, dict) else str(error), text_parts)
+    combined = " ".join(text_parts)
+    return bool(AUTH_ERROR_PATTERN.search(combined))
+
+
+# ── Summarizer ────────────────────────────────────────────────────────────────
+
+
+class LcmSummarizer:
+    """
+    LLM-based summarizer with depth-aware prompts and fallback.
+
+    Usage::
+
+        summarizer = LcmSummarizer(complete_fn, provider="anthropic", model="claude-3-haiku")
+        summary = await summarizer.summarize(text, aggressive=False)
+    """
+
+    def __init__(
+        self,
+        complete: CompleteFn,
+        provider: str = "",
+        model: str = "",
+        timeout_s: float = SUMMARIZER_TIMEOUT_S,
+        custom_instructions: str | None = None,
+    ) -> None:
+        self._complete = complete
+        self._provider = provider
+        self._model = model
+        self._timeout_s = timeout_s
+        self._custom_instructions = custom_instructions
+
+    async def summarize(
+        self,
+        text: str,
+        aggressive: bool = False,
+        previous_summary: str | None = None,
+        is_condensed: bool = False,
+        depth: int = 0,
+    ) -> str:
+        """
+        Summarize text using LLM with appropriate prompt.
+
+        Returns the summary text. Falls back to deterministic
+        truncation if the LLM returns empty output.
+        """
+        input_tokens = estimate_tokens_fallback(text)
+        target_tokens = resolve_target_tokens(
+            input_tokens, aggressive, is_condensed
+        )
+
+        if is_condensed:
+            prompt = build_condensed_prompt(
+                text, target_tokens, depth,
+                previous_summary, self._custom_instructions,
+            )
+        else:
+            prompt = build_leaf_prompt(
+                text, target_tokens, aggressive,
+                previous_summary, self._custom_instructions,
+            )
+
+        label = f"{'condensed' if is_condensed else 'leaf'} d={depth}"
+
+        try:
+            result = await asyncio.wait_for(
+                self._complete(
+                    model=self._model,
+                    messages=[{"role": "user", "content": prompt}],
+                    system=SYSTEM_PROMPT,
+                    max_tokens=max(target_tokens * 2, 2048),
+                    temperature=0.3,
+                    provider=self._provider or None,
+                ),
+                timeout=self._timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[lcm] summarizer timeout after %.0fs (%s)", self._timeout_s, label)
+            return deterministic_fallback_summary(text)
+        except Exception as exc:
+            if detect_provider_auth_failure(exc):
+                raise LcmProviderAuthError(self._provider, self._model, str(exc))
+            logger.warning("[lcm] summarizer error (%s): %s", label, exc)
+            return deterministic_fallback_summary(text)
+
+        # Normalize response
+        summary = normalize_completion_summary(
+            result.content if hasattr(result, "content") else result
+        )
+
+        if not summary.strip():
+            logger.warning("[lcm] empty summary from LLM (%s), using fallback", label)
+            return deterministic_fallback_summary(text)
+
+        return summary
