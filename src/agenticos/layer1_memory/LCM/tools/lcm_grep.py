@@ -18,50 +18,31 @@ def run_lcm_grep(
     session_id: str | None = None,
     limit: int = 15,
 ) -> str:
-    """Execute FTS5/LIKE search across messages and summaries."""
-    
+    """
+    Searches every node in the DAG across all depths.
+    Returns results with precise depth labels.
+    """
     conv_id = None
     if session_id:
         conv = conversations.get_conversation_by_session_id(session_id)
         if conv:
             conv_id = conv.conversation_id
 
-    # 1. Search Messages
-    msg_hits = conversations.search_messages(
-        query=query, 
-        mode="full_text", 
-        conversation_id=conv_id, 
-        limit=limit
-    )
+    sum_hits = summaries.search_summaries(query, "full_text", conv_id, limit)
+    msg_hits = conversations.search_messages(query, "full_text", conv_id, limit)
 
-    # 2. Search Summaries
-    sum_hits = summaries.search_summaries(
-        query=query, 
-        mode="full_text", 
-        conversation_id=conv_id, 
-        limit=limit
-    )
+    results = []
+    
+    # Dán nhãn chuẩn hóa cho Summaries
+    for hit in sum_hits:
+        depth_val = hit.get('depth', '?')
+        results.append(f"[Depth {depth_val} | {hit['summary_id']}] {hit['snippet']}")
 
-    if not msg_hits and not sum_hits:
-        return f"No results found for query: '{query}'"
+    # Dán nhãn chuẩn hóa cho Raw Messages
+    for hit in msg_hits:
+        results.append(f"[Depth RAW | msg_{hit['message_id']}] {hit['role'].upper()}: {hit['snippet']}")
 
-    res = [f"Search results for '{query}':\n"]
+    if not results:
+        return f"No matches found for '{query}' in DAG."
 
-    if sum_hits:
-        res.append(f"--- Summaries ({len(sum_hits)}) ---")
-        for hit in sum_hits:
-            res.append(
-                f"[Summary {hit['summary_id']} | Depth {hit.get('depth', '?')}]\n"
-                f"{hit['snippet']}\n"
-            )
-
-    if msg_hits:
-        res.append(f"--- Messages ({len(msg_hits)}) ---")
-        for hit in msg_hits:
-            res.append(
-                f"[Message {hit['message_id']} | {hit['role']}]\n"
-                f"{hit['snippet']}\n"
-            )
-
-    res.append("Use lcm_describe on an ID for full metadata, or lcm_expand to read its contents.")
-    return "\n".join(res)
+    return "GREP RESULTS:\n" + "\n".join(results)

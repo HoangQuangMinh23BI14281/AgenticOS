@@ -6,6 +6,7 @@ from .config import LcmConfig, resolve_lcm_config
 from .engine import LcmEngine
 from .types import (
     CompleteFn,
+    CompletionContentBlock,
     CompletionResult,
     LcmDependencies,
     MessagePartRecord,
@@ -26,6 +27,7 @@ __all__ = [
     "LcmDependencies",
     "TokenizerProtocol",
     "CompleteFn",
+    "CompletionContentBlock",
     "CompletionResult",
     "MessageRole",
     "MessagePartType",

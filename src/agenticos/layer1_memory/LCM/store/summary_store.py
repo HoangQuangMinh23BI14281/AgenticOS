@@ -11,6 +11,7 @@ Ported from store/summary-store.ts.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -138,14 +139,34 @@ class SummaryStore:
     ) -> None:
         self._pool = pool
         self._fts5 = fts5_available
-
-        # Immutable data cache — summaries never change after creation
         self._summary_cache: dict[str, SummaryRecord] = {}
-        # Expensive CTE cache — TTL because new children may be added
         self._subtree_cache: TTLCache = TTLCache(
             maxsize=subtree_cache_size, ttl=subtree_cache_ttl
         )
 
+    def _sanitize_content(self, text: str) -> str:
+        """
+        Ngăn chặn triệt để Prompt Leakage (như vụ Node 2595 tokens).
+        Loại bỏ các thẻ XML và Header hệ thống trước khi lưu vào DB.
+        """
+        if not text: return ""
+        
+        if "</think>" in text:
+            text = text.split("</think>")[-1]
+
+        patterns = [
+            r"<previous_context>.*?</previous_context>",
+            r"<conversation_segment>.*?</conversation_segment>",
+            r"<conversation_to_condense>.*?</conversation_to_condense>",
+            r"<historical_logs>.*?</historical_logs>",
+            r"<\w+>", r"</\w+>", 
+            r"\*\*output requirements:\*\*",
+            r"\*\*previous_context\*\*",
+        ]
+        for p in patterns:
+            text = re.sub(p, "", text, flags=re.DOTALL | re.IGNORECASE)
+
+        return text.strip()
     # ── Cache Management ──────────────────────────────────────────────────
 
     def invalidate_cache(self, summary_id: str | None = None) -> None:
@@ -180,7 +201,11 @@ class SummaryStore:
         source_message_token_count: int = 0,
         model: str = "unknown",
     ) -> SummaryRecord:
-        """Insert a new summary and cache it."""
+        """Insert a new summary với bộ lọc Sanitizer tích hợp."""
+        
+        # CHỖ SỬA QUAN TRỌNG: Lọc nội dung trước khi insert
+        clean_content = self._sanitize_content(content)
+        
         resolved_depth = _safe_int(depth) if depth is not None else (0 if kind == SummaryKind.LEAF else 1)
 
         def _insert(conn: sqlite3.Connection) -> SummaryRecord:
@@ -191,30 +216,22 @@ class SummaryStore:
                         descendant_token_count, source_message_token_count, model
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    summary_id,
-                    conversation_id,
-                    kind.value,
-                    resolved_depth,
-                    content,
-                    token_count,
-                    json.dumps(file_ids or []),
+                    summary_id, conversation_id, kind.value, resolved_depth,
+                    clean_content, # Lưu nội dung đã sạch
+                    token_count, json.dumps(file_ids or []),
                     earliest_at.isoformat() if earliest_at else None,
                     latest_at.isoformat() if latest_at else None,
-                    max(0, descendant_count),
-                    max(0, descendant_token_count),
-                    max(0, source_message_token_count),
-                    model,
+                    max(0, descendant_count), max(0, descendant_token_count),
+                    max(0, source_message_token_count), model,
                 ),
             )
-            # FTS5 index (best-effort)
             if self._fts5:
                 try:
                     conn.execute(
                         "INSERT INTO summaries_fts(summary_id, content) VALUES (?, ?)",
-                        (summary_id, content),
+                        (summary_id, clean_content),
                     )
-                except Exception:
-                    pass
+                except Exception: pass
             conn.commit()
 
             row = conn.execute(
@@ -400,23 +417,27 @@ class SummaryStore:
                 (summary_id,),
             ).fetchall()
 
-            seen: set[str] = set()
-            result: list[SummarySubtreeNode] = []
+            node_map: dict[str, SummarySubtreeNode] = {}
             for r in rows:
                 sid = r["summary_id"]
-                if sid in seen:
-                    continue
-                seen.add(sid)
-                base = _to_summary(r)
-                node = SummarySubtreeNode(
-                    **{k: v for k, v in base.__dict__.items()},
-                    depth_from_root=max(0, int(r["depth_from_root"] or 0)),
-                    parent_summary_id=r["parent_summary_id"],
-                    path=r["path"] if isinstance(r["path"], str) else "",
-                    child_count=_safe_int(r["child_count"]),
-                )
-                result.append(node)
-            return result
+                pid = r["parent_summary_id"]
+                
+                if sid not in node_map:
+                    base = _to_summary(r)
+                    node = SummarySubtreeNode(
+                        **dataclasses.asdict(base),
+                        depth_from_root=max(0, int(r["depth_from_root"] or 0)),
+                        parent_ids=[pid] if pid else [],
+                        parent_summary_id=pid,
+                        path=r["path"] if isinstance(r["path"], str) else "",
+                        child_count=_safe_int(r["child_count"]),
+                    )
+                    node_map[sid] = node
+                else:
+                    # Collect multi-parent lineage
+                    if pid and pid not in node_map[sid].parent_ids:
+                        node_map[sid].parent_ids.append(pid)
+            return list(node_map.values())
 
         result = self._pool.execute_read(_get)
         self._subtree_cache[summary_id] = result
@@ -659,7 +680,7 @@ class SummaryStore:
             args.append(limit)
 
             rows = conn.execute(
-                f"""SELECT s.summary_id, s.conversation_id, s.kind,
+                f"""SELECT s.summary_id, s.conversation_id, s.kind, s.depth,
                            snippet(summaries_fts, 1, '', '', '...', 32) AS snippet,
                            s.created_at
                     FROM summaries_fts
@@ -669,15 +690,13 @@ class SummaryStore:
                 args,
             ).fetchall()
             return [dict(r) for r in rows]
-
         return self._pool.execute_read(_search)
 
     def _search_like(
         self, query: str, limit: int, conversation_id: int | None
     ) -> list[dict[str, Any]]:
         plan = build_like_search_plan("content", query)
-        if not plan["terms"]:
-            return []
+        if not plan["terms"]: return []
 
         def _search(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             where = list(plan["where"])
@@ -687,8 +706,9 @@ class SummaryStore:
                 args.append(conversation_id)
             args.append(limit)
 
+            # Đã thêm depth vào đây
             rows = conn.execute(
-                f"""SELECT summary_id, conversation_id, kind, content, created_at
+                f"""SELECT summary_id, conversation_id, kind, depth, content, created_at
                     FROM summaries WHERE {' AND '.join(where)}
                     ORDER BY created_at DESC LIMIT ?""",
                 args,
@@ -698,12 +718,12 @@ class SummaryStore:
                     "summary_id": r["summary_id"],
                     "conversation_id": r["conversation_id"],
                     "kind": r["kind"],
+                    "depth": r["depth"],
                     "snippet": create_fallback_snippet(r["content"], query),
                     "created_at": r["created_at"],
                 }
                 for r in rows
             ]
-
         return self._pool.execute_read(_search)
 
     def _search_regex(

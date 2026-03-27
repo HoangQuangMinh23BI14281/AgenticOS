@@ -178,6 +178,7 @@ class SummaryRecord:
 class SummarySubtreeNode(SummaryRecord):
     """Summary record enriched with subtree traversal metadata."""
     depth_from_root: int = 0
+    parent_ids: list[str] = field(default_factory=list)
     parent_summary_id: str | None = None
     path: str = ""
     child_count: int = 0

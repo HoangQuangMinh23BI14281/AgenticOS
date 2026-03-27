@@ -27,6 +27,9 @@ from .store import ConversationStore, SummaryStore
 from .summarize import LcmSummarizer
 from .compaction import CompactionEngine
 from .file_dispatcher import FileDispatcher
+from .tools.lcm_grep import run_lcm_grep
+from .tools.lcm_describe import run_lcm_describe
+from .tools.lcm_expand import run_lcm_expand
 
 logger = logging.getLogger("lcm.engine")
 
@@ -59,7 +62,7 @@ class LcmEngine:
             model=config.summary_model,
         )
         self.compaction = CompactionEngine(
-            self.conversations, self.summaries, self.summarizer, config
+            self.conversations, self.summaries, self.summarizer, config, tokenizer=self.tokenizer
         )
         self.file_dispatcher = FileDispatcher(
             self.conversations, self.summaries, self.summarizer, config
@@ -98,8 +101,8 @@ class LcmEngine:
                 ptype = MessagePartType.TEXT
                 text = f"ToolOutput: {part.get('text_content', '')}"
 
-            tokens = self.tokenizer.encode(text) if text else 0
-            total_tokens += tokens
+            tokens = self.tokenizer.encode(text) if text else []
+            total_tokens += len(tokens)
             content_pieces.append(text)
 
             expanded_parts.append({
@@ -234,6 +237,24 @@ class LcmEngine:
 
         # Compaction pass (3-level escalation)
         await self.compaction.compact_until_under(conv.conversation_id, context_budget)
+
+    # ── Tools ─────────────────────────────────────────────────────────────
+
+    def grep(self, query: str, session_id: str | None = None, limit: int = 15) -> str:
+        return run_lcm_grep(query, self.conversations, self.summaries, session_id, limit)
+
+    def describe(self, node_id: str) -> str:
+        return run_lcm_describe(node_id, self.conversations, self.summaries)
+
+    async def expand(self, item_id: str, query: str | None = None) -> str:
+        summarizer = self.compaction._summarizer if hasattr(self, 'compaction') else None
+        return await run_lcm_expand(
+            item_id=item_id,
+            query=query or "",
+            conversations=self.conversations,
+            summaries=self.summaries,
+            summarizer_or_dispatcher=summarizer
+        )
 
     def close(self) -> None:
         """Cleanup database connections."""

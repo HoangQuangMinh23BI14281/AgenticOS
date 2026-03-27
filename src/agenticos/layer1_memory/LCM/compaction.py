@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from uuid import uuid4
 
-from .types import CompactionDecision, CompactionResult, SummaryKind
+from .types import CompactionDecision, CompactionResult, SummaryKind, ContextItemType
 from .config import LcmConfig
 from .store import ConversationStore, SummaryStore
 from .summarize import LcmSummarizer
@@ -47,11 +48,13 @@ class CompactionEngine:
         summary_store: SummaryStore,
         summarizer: LcmSummarizer,
         config: LcmConfig,
+        tokenizer: TokenizerProtocol | None = None,
     ) -> None:
         self._conv_store = conversation_store
         self._summary_store = summary_store
         self._summarizer = summarizer
         self._config = config
+        self._tokenizer = tokenizer
 
     def evaluate(self, conversation_id: int, context_limit: int) -> CompactionDecision:
         """
@@ -169,7 +172,7 @@ class CompactionEngine:
             while made_progress and state.current_tokens > state.target_budget and state.rounds < state.max_rounds:
                 state.rounds += 1
                 r = await self.compact(conversation_id, aggressive=False)
-                if r.action_taken:
+                if r.action_taken and r.tokens_after < state.current_tokens:
                     results.append(r)
                     state.current_tokens = r.tokens_after
                 else:
@@ -182,7 +185,7 @@ class CompactionEngine:
             while made_progress and state.current_tokens > state.target_budget and state.rounds < state.max_rounds:
                 state.rounds += 1
                 r = await self.compact(conversation_id, aggressive=True)
-                if r.action_taken:
+                if r.action_taken and r.tokens_after < state.current_tokens:
                     results.append(r)
                     state.current_tokens = r.tokens_after
                 else:
@@ -210,14 +213,176 @@ class CompactionEngine:
 
         return results
 
-    # ── Stubbed internal passes ────────────────────────────────────────────────
-
     async def _leaf_pass(self, conv_id: int, aggressive: bool) -> str | None:
-        """Find raw messages to condense into a leaf node. Impl stubbed."""
-        # TODO: Full LLM loop, replace context items, insert new summary.
-        return None
+        """Find raw messages to condense into a leaf node (Depth 0)."""
+        items = self._summary_store.get_context_items(conv_id)
+        
+        chunk = []
+        start_idx = -1
+        for i, item in enumerate(items):
+            if item.item_type == ContextItemType.MESSAGE:
+                if start_idx == -1: start_idx = i
+                chunk.append(item)
+            else:
+                if chunk: break
+                
+        # =========================================================
+        # FIX 1: BẢO VỆ ĐUÔI TỐI THƯỢNG (ABSOLUTE TAIL PROTECTION)
+        # =========================================================
+        is_at_tail = (start_idx + len(chunk) == len(items))
+        
+        if is_at_tail:
+            # Normal: Giữ 4 tin nhắn. Aggressive (Sắp tràn RAM): BẮT BUỘC giữ ít nhất 1 tin nhắn.
+            tail_keep = 1 if aggressive else 4
+            
+            if len(chunk) > tail_keep:
+                chunk = chunk[:-tail_keep]
+            else:
+                # Trả về None: Thà không nén được còn hơn là xóa mất Fresh Tail của User
+                return None
+
+        # =========================================================
+        # FIX 2: ÉP CẤU TRÚC DAG (Chỉ gộp tối đa 4 node 1 lúc)
+        # =========================================================
+        GROUP_SIZE = 4
+        if len(chunk) > GROUP_SIZE:
+            chunk = chunk[:GROUP_SIZE]
+
+        # =========================================================
+        # FIX 3: CHỐNG NÉN 1-TO-1 (VÔ NGHĨA VÀ GÂY MẤT DỮ LIỆU)
+        # =========================================================
+        if len(chunk) < 2:
+            return None
+            
+        text_blocks = []
+        message_ids = []
+        for item in chunk:
+            msg = self._conv_store.get_message_by_id(item.message_id)
+            if msg:
+                text_blocks.append(f"{msg.role.value.capitalize()}: {msg.content}")
+                message_ids.append(msg.message_id)
+        
+        if not text_blocks:
+            return None
+
+        full_text = "\n\n".join(text_blocks)
+        summary_id = f"sum_{uuid4().hex[:8]}"
+        summary_text = await self._summarizer.summarize(full_text, aggressive=aggressive)
+        
+        # Đếm token chuẩn
+        if self._tokenizer:
+            token_count = len(self._tokenizer.encode(summary_text))
+        else:
+            token_count = len(summary_text) // 4
+            
+        total_source_tokens = sum(m.token_count for m in [self._conv_store.get_message_by_id(mid) for mid in message_ids] if m)
+        
+        self._summary_store.insert_summary(
+            summary_id=summary_id,
+            conversation_id=conv_id,
+            kind=SummaryKind.LEAF,
+            content=summary_text,
+            token_count=token_count,
+            depth=0,
+            source_message_token_count=total_source_tokens
+        )
+        self._summary_store.link_to_messages(summary_id, message_ids)
+        
+        self._summary_store.replace_context_range_with_summary(
+            conversation_id=conv_id,
+            start_ordinal=items[start_idx].ordinal,
+            end_ordinal=items[start_idx + len(chunk) - 1].ordinal,
+            summary_id=summary_id
+        )
+        
+        return summary_id
 
     async def _condensed_pass(self, conv_id: int, aggressive: bool) -> str | None:
-        """Find multiple active summaries to merge. Impl stubbed."""
-        # TODO: Full LLM loop, replace context items, insert new summary.
-        return None
+        """Find multiple active summaries of the SAME DEPTH to merge."""
+        items = self._summary_store.get_context_items(conv_id)
+        
+        chunk = []
+        start_idx = -1
+        target_depth = -1
+        
+        # Thuật toán tìm chuỗi các Summary liền kề CÙNG ĐỘ SÂU
+        for i, item in enumerate(items):
+            if item.item_type == ContextItemType.SUMMARY:
+                s = self._summary_store.get_summary(item.summary_id)
+                if not s: continue
+                
+                if start_idx == -1:
+                    start_idx = i
+                    target_depth = s.depth
+                    chunk.append((item, s))
+                elif s.depth == target_depth:
+                    # Nếu cùng độ sâu với chunk hiện tại thì gộp tiếp
+                    chunk.append((item, s))
+                else:
+                    # Đụng độ sâu khác. Nếu chunk trước đó đã đủ lớn thì dừng lại để nén
+                    if len(chunk) >= (2 if aggressive else 4):
+                        break
+                    # Nếu chưa đủ lớn, đập đi xây lại chunk mới từ item này
+                    chunk = [(item, s)]
+                    start_idx = i
+                    target_depth = s.depth
+            else:
+                # Đụng phải tin nhắn thô (Message), ngắt chuỗi
+                if len(chunk) >= (2 if aggressive else 4):
+                    break
+                chunk = []
+                start_idx = -1
+                target_depth = -1
+        
+        GROUP_SIZE = 4
+        if len(chunk) > GROUP_SIZE:
+            chunk = chunk[:GROUP_SIZE]
+
+        if len(chunk) < (2 if aggressive else GROUP_SIZE):
+            return None
+            
+        summary_ids = []
+        text_blocks = []
+        total_source_tokens = 0
+        
+        # Lúc này chắc chắn mọi s trong chunk đều có cùng target_depth
+        for item, s in chunk:
+            text_blocks.append(f"[Depth {s.depth} Summary]:\n{s.content}")
+            summary_ids.append(s.summary_id)
+            total_source_tokens += s.source_message_token_count
+        
+        full_text = "\n\n".join(text_blocks)
+        summary_id = f"sum_{uuid4().hex[:8]}"
+        
+        # Depth mới sẽ nâng lên 1 cấp so với các node con
+        new_depth = target_depth + 1
+        
+        summary_text = await self._summarizer.summarize(
+            full_text, aggressive=aggressive, is_condensed=True, depth=new_depth
+        )
+        
+        if self._tokenizer:
+            token_count = len(self._tokenizer.encode(summary_text))
+        else:
+            token_count = len(summary_text) // 4
+            
+        self._summary_store.insert_summary(
+            summary_id=summary_id,
+            conversation_id=conv_id,
+            kind=SummaryKind.CONDENSED,
+            content=summary_text,
+            token_count=token_count,
+            depth=new_depth,
+            source_message_token_count=total_source_tokens
+        )
+        
+        self._summary_store.link_to_parents(summary_id, summary_ids)
+        
+        self._summary_store.replace_context_range_with_summary(
+            conversation_id=conv_id,
+            start_ordinal=items[start_idx].ordinal,
+            end_ordinal=items[start_idx + len(chunk) - 1].ordinal,
+            summary_id=summary_id
+        )
+        
+        return summary_id

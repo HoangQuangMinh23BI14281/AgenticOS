@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AgenticOS | 3-Tier Recursive DAG (1-4-16)</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-body: #0d1117;
+            --bg-node: #161b22;
+            --text-main: #e6edf3;
+            --text-muted: #8b949e;
+            --color-d2: #ffcecb;
+            --color-d1: #ff7b72;
+            --color-d0: #d29922;
+            --color-raw: #58a6ff;
+            --line-solid: #ff7b72;
+            --line-dashed: #484f58;
+        }
+
+        body {
+            background-color: var(--bg-body);
+            color: var(--text-main);
+            font-family: 'JetBrains Mono', monospace;
+            margin: 0; padding: 40px;
+            display: flex; flex-direction: column; align-items: center;
+            min-height: 100vh; overflow-x: auto;
+        }
+
+        .dag-container {
+            position: relative;
+            display: inline-block;
+            min-width: 1600px; /* Đảm bảo đủ không gian cho 16 node D0 */
+        }
+
+        #dag-svg {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* --- HIERARCHY ENGINE --- */
+        .tree, .tree ul {
+            display: flex;
+            justify-content: center;
+            list-style: none;
+            padding: 0; margin: 0;
+        }
+
+        .tree ul {
+            margin-top: 60px; /* Khoảng cách đứng giữa các tầng */
+            gap: 10px;
+        }
+
+        .tree li {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
+        }
+
+        /* --- NODE STYLING --- */
+        .node {
+            padding: 10px 12px;
+            border-radius: 6px;
+            background-color: var(--bg-node);
+            font-size: 10px;
+            line-height: 1.4;
+            min-width: 120px;
+            z-index: 1;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            text-align: left;
+        }
+
+        .node-d2 { border: 2px solid var(--color-d2); width: 200px; }
+        .node-d1 { border: 1.5px solid var(--color-d1); background: rgba(255,123,114,0.05); }
+        .node-d0 { border: 1px solid var(--color-d0); }
+        .node-raw { border: 1px dashed var(--color-raw); background: transparent; min-width: 100px; }
+
+        .tag { font-weight: 700; margin-bottom: 4px; text-transform: uppercase; font-size: 9px; }
+        .tag-d2 { color: var(--color-d2); }
+        .tag-d1 { color: var(--color-d1); }
+        .tag-d0 { color: var(--color-d0); }
+        .tag-raw { color: var(--color-raw); }
+
+        .meta { color: var(--text-muted); font-size: 9px; }
+    </style>
+</head>
+<body>
+
+    <div class="dag-container">
+        <svg id="dag-svg"></svg>
+
+        <div class="tree">
+            <ul>
+                <li>
+                    <div class="node node-d2" id="root">
+                        <div class="tag tag-d2">SUMMARY • DEPTH 2</div>
+                        <div class="n-val">sum_d2_root</div>
+                        <div class="meta">Contains 4 D1 • 16 D0</div>
+                    </div>
+
+                    <ul>
+                        <script>
+                            for(let i=1; i<=4; i++) {
+                                document.write(`
+                                    <li>
+                                        <div class="node node-d1">
+                                            <div class="tag tag-d1">SUMMARY • D1</div>
+                                            <div class="n-val">sum_d1_0${i}</div>
+                                            <div class="meta">4 clusters</div>
+                                        </div>
+                                        <ul>
+                                            ${Array(4).fill(0).map((_, j) => `
+                                                <li>
+                                                    <div class="node node-d0">
+                                                        <div class="tag tag-d0">D0 • CLUSTER</div>
+                                                        <div class="meta">Node 0${i}_0${j+1}</div>
+                                                    </div>
+                                                    <ul>
+                                                        <li>
+                                                            <div class="node node-raw">
+                                                                <div class="tag tag-raw">RAW MSGS</div>
+                                                                <div class="meta">Verbatim Store</div>
+                                                            </div>
+                                                        </li>
+                                                    </ul>
+                                                </li>
+                                            `).join('')}
+                                        </ul>
+                                    </li>
+                                `);
+                            }
+                        </script>
+                    </ul>
+                </li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        function drawCurves() {
+            const svg = document.getElementById('dag-svg');
+            svg.innerHTML = ''; 
+            const svgRect = svg.getBoundingClientRect();
+
+            const lis = document.querySelectorAll('.tree li');
+            lis.forEach(li => {
+                const ul = li.querySelector(':scope > ul');
+                if (!ul) return;
+
+                const parentNode = li.querySelector(':scope > .node');
+                const childNodes = Array.from(ul.children).map(c => c.querySelector(':scope > .node')).filter(n => n);
+
+                const pRect = parentNode.getBoundingClientRect();
+                const startX = pRect.left + pRect.width / 2 - svgRect.left;
+                const startY = pRect.bottom - svgRect.top;
+
+                childNodes.forEach(childNode => {
+                    const cRect = childNode.getBoundingClientRect();
+                    const endX = cRect.left + cRect.width / 2 - svgRect.left;
+                    const endY = cRect.top - svgRect.top;
+
+                    const curveY = startY + (endY - startY) / 2;
+                    const d = `M ${startX} ${startY} C ${startX} ${curveY}, ${endX} ${curveY}, ${endX} ${endY}`;
+
+                    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                    path.setAttribute("d", d);
+                    path.setAttribute("fill", "none");
+                    path.setAttribute("stroke-width", "1.2");
+
+                    // Định dạng màu và kiểu đường nối
+                    if (childNode.classList.contains('node-raw')) {
+                        path.setAttribute("stroke", "var(--line-dashed)");
+                        path.setAttribute("stroke-dasharray", "3 3");
+                    } else if (childNode.classList.contains('node-d0')) {
+                        path.setAttribute("stroke", "var(--color-d0)");
+                        path.setAttribute("opacity", "0.6");
+                    } else {
+                        path.setAttribute("stroke", "var(--color-d1)");
+                    }
+
+                    svg.appendChild(path);
+                });
+            });
+        }
+
+        window.addEventListener('load', () => {
+            drawCurves();
+            // Vẽ lại sau 100ms để đảm bảo layout đã ổn định
+            setTimeout(drawCurves, 100); 
+        });
+        window.addEventListener('resize', drawCurves);
+    </script>
+</body>
+</html>

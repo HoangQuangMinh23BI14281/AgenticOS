@@ -78,10 +78,13 @@ def resolve_target_tokens(
 ) -> int:
     """Calculate target summary token count based on input and mode."""
     if is_condensed:
-        return max(512, condensed_target)
+        # Nén mạnh D1/D2: Ép xuống tối đa 30% so với tổng đầu vào, nhưng không quá 500 token.
+        return max(150, min(500, int(input_tokens * 0.3)))
     if aggressive:
-        return max(96, min(640, int(input_tokens * 0.2)))
-    return max(192, min(1200, int(input_tokens * 0.35)))
+        # Nén Leaf khi sắp tràn: Cực kỳ ngắn gọn
+        return max(50, min(150, int(input_tokens * 0.15)))
+    # Nén Leaf bình thường
+    return max(100, min(300, int(input_tokens * 0.25)))
 
 
 # ── Prompt Builders ───────────────────────────────────────────────────────────
@@ -272,18 +275,26 @@ def deterministic_fallback_summary(text: str, max_tokens: int = 512) -> str:
 
 
 def normalize_completion_summary(content: Any) -> str:
-    """Extract text from provider completion response content."""
-    chunks: list[str] = []
-    _collect_text(content, chunks)
-    # Deduplicate exact fragments
-    seen: set[str] = set()
-    unique: list[str] = []
-    for chunk in chunks:
-        trimmed = chunk.strip()
-        if trimmed and trimmed not in seen:
-            seen.add(trimmed)
-            unique.append(trimmed)
-    return "\n".join(unique).strip()
+    """Extract text safely from provider completion response."""
+    if isinstance(content, str):
+        return content.strip()
+    
+    if hasattr(content, "text"):
+        return str(content.text).strip()
+        
+    if isinstance(content, list) and len(content) > 0:
+        first_item = content[0]
+        if hasattr(first_item, "text"):
+            return str(first_item.text).strip()
+        if isinstance(first_item, str):
+            return first_item.strip()
+            
+    if isinstance(content, dict):
+        for key in ["text", "content", "summary", "response"]:
+            if key in content and isinstance(content[key], str):
+                return content[key].strip()
+
+    return str(content).strip()
 
 
 def _collect_text(value: Any, out: list[str]) -> None:
@@ -351,13 +362,14 @@ class LcmSummarizer:
         previous_summary: str | None = None,
         is_condensed: bool = False,
         depth: int = 0,
+        custom_instructions: str | None = None, # Thêm tham số này để Expand Tool dùng được
     ) -> str:
         """
         Summarize text using LLM with appropriate prompt.
-
-        Returns the summary text. Falls back to deterministic
-        truncation if the LLM returns empty output.
         """
+        # Ưu tiên custom_instructions được truyền vào (dùng cho Expand Query)
+        instr = custom_instructions if custom_instructions else self._custom_instructions
+
         input_tokens = estimate_tokens_fallback(text)
         target_tokens = resolve_target_tokens(
             input_tokens, aggressive, is_condensed
@@ -366,44 +378,52 @@ class LcmSummarizer:
         if is_condensed:
             prompt = build_condensed_prompt(
                 text, target_tokens, depth,
-                previous_summary, self._custom_instructions,
+                previous_summary, instr,
             )
         else:
             prompt = build_leaf_prompt(
                 text, target_tokens, aggressive,
-                previous_summary, self._custom_instructions,
+                previous_summary, instr,
             )
 
         label = f"{'condensed' if is_condensed else 'leaf'} d={depth}"
+        
+        # In log ra để bạn biết LLM đang được gọi bằng Prompt gì!
+        logger.debug(f"[lcm] Calling LLM for {label} - Target: {target_tokens} tok")
 
         try:
             result = await asyncio.wait_for(
                 self._complete(
                     model=self._model,
-                    messages=[{"role": "user", "content": prompt}],
-                    system=SYSTEM_PROMPT,
+                    # Chú ý: Cấu trúc messages chuẩn của API
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
                     max_tokens=max(target_tokens * 2, 2048),
                     temperature=0.3,
-                    provider=self._provider or None,
                 ),
                 timeout=self._timeout_s,
             )
+            
+            # Xử lý nội dung trả về
+            summary = normalize_completion_summary(
+                result.content if hasattr(result, "content") else result
+            )
+            
+            # Cắt bỏ thẻ <think> của Deepseek (nếu có)
+            if "</think>" in summary:
+                summary = summary.split("</think>")[-1].strip()
+
+            if not summary:
+                logger.warning("[lcm] empty summary from LLM (%s), using fallback", label)
+                return deterministic_fallback_summary(text)
+
+            return summary
+
         except asyncio.TimeoutError:
             logger.warning("[lcm] summarizer timeout after %.0fs (%s)", self._timeout_s, label)
             return deterministic_fallback_summary(text)
         except Exception as exc:
-            if detect_provider_auth_failure(exc):
-                raise LcmProviderAuthError(self._provider, self._model, str(exc))
-            logger.warning("[lcm] summarizer error (%s): %s", label, exc)
+            logger.error(f"[lcm] summarizer error ({label}): {exc}")
             return deterministic_fallback_summary(text)
-
-        # Normalize response
-        summary = normalize_completion_summary(
-            result.content if hasattr(result, "content") else result
-        )
-
-        if not summary.strip():
-            logger.warning("[lcm] empty summary from LLM (%s), using fallback", label)
-            return deterministic_fallback_summary(text)
-
-        return summary
