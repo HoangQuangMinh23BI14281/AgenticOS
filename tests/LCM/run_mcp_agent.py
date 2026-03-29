@@ -16,51 +16,87 @@ sys.path.append(str(src_dir.resolve()))
 class SmallModelAgent:
     def __init__(self, model_name: str):
         self.model_name = model_name
+        # Ollama mặc định chạy ở port 11434
+        self.url = "http://localhost:11434/api/chat" 
 
     async def chat(self, messages: List[Dict]):
-        # Since running a real LLM local API might be flaky during this session,
-        # we'll use a mocked LLM response that mimics a 1.5B model's reasoning.
-        content = messages[-1]["content"]
-        if "Chapter 1" in content:
-            return "Based on the memory results, Chapter 1 involves Harry's early life. The memory grep returned specific summaries about his arrival at the Dursleys."
-        return "I can see the memory results, but I need more specific details to answer."
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": False  # Tắt stream để lấy nguyên cục response cho dễ xử lý
+        }
+        
+        async with httpx.AsyncClient() as client:
+            # Gửi tin nhắn thực sự cho AI
+            response = await client.post(self.url, json=payload, timeout=1000.0)
+            if response.status_code == 200:
+                result = response.json()
+                return result['message']['content'] # Đây mới là câu trả lời của AI
+            else:
+                return f"Lỗi gọi AI: {response.text}"
 
 # MCP Bridge (Simple way to call our LCM MCP server via stdio)
 class LcmMcpBridge:
     def __init__(self):
-        # We'll use the 'mcp' CLI to invoke the tools for this example
-        # In a real app, you'd use the MCP Python SDK's ClientSession
         pass
 
-    def call_tool(self, tool_name: str, args: Dict):
-        # For this PoC, we'll just call the python script directly as a 'command'
-        import subprocess
-        # This is a bit of a hack for the demo; a real client would use JSON-RPC over stdio
-        # But here we'll just call the engine directly for speed in the demo script
+    async def call_tool(self, tool_name: str, args: Dict):
         from agenticos.layer1_memory.LCM.lcm_mcp import lcm_grep, lcm_expand, lcm_describe
+        import inspect
         
-        if tool_name == "lcm_grep": return lcm_grep(**args)
-        if tool_name == "lcm_expand": return lcm_expand(**args)
-        if tool_name == "lcm_describe": return lcm_describe(**args)
-        return "Tool not found."
+        tool_fn = {
+            "lcm_grep": lcm_grep,
+            "lcm_expand": lcm_expand,
+            "lcm_describe": lcm_describe
+        }.get(tool_name)
+        
+        if not tool_fn: return "Tool not found."
+        
+        if inspect.iscoroutinefunction(tool_fn):
+            return await tool_fn(**args)
+        else:
+            return tool_fn(**args)
 
 async def main():
     agent = SmallModelAgent("qwen3.5:2b")
     mcp = LcmMcpBridge()
     
     print("--- Model-Agnostic MCP Agent (vLLM/Ollama + LCM) ---")
-    print("User: Search my history for 'Chapter 1' and tell me what was found.")
+    user_query = "Tìm tóm tắt sâu nhất về 'Harry Potter', kiểm tra metadata của nó và lấy nội dung gốc chi tiết."
+    print(f"User: {user_query}")
     
     # 1. Search using LCM tool
-    print("[Agent] Calling lcm_grep...")
-    search_results = mcp.call_tool("lcm_grep", {"query": "Chapter 1"})
-    print(f"[Observation] {search_results[:100]}...")
-    
-    # 2. Final response using the context from the tool
-    prompt = f"Context from Memory Server:\n{search_results}\n\nUser Question: What was found about Chapter 1?"
+    print("\n[Agent] Step 1: Searching memory history...")
+    search_results = await mcp.call_tool("lcm_grep", {"query": "Harry Potter"})
+    print(f"[Observation] Grep results (first 100 chars): {search_results[:100]}...")
+
+    # Simulating agent picking an ID (usually 'sum_1' in a fresh stress test)
+    target_id = "sum_1" 
+    if "ID: " in search_results:
+        # Crude extraction for the demo
+        target_id = search_results.split("ID: ")[1].split("]")[0]
+
+    # 2. Get Metadata
+    print(f"\n[Agent] Step 2: Describing node '{target_id}' to check depth/lineage...")
+    metadata = await mcp.call_tool("lcm_describe", {"item_id": target_id})
+    print(f"[Observation] Metadata:\n{metadata}")
+
+    # 3. Expand Summary
+    print(f"\n[Agent] Step 3: Expanding summary '{target_id}' for lossless content...")
+    full_content = await mcp.call_tool("lcm_expand", {"item_id": target_id, "query": "Harry Potter"})
+    print(f"[Observation] Expanded Content (first 100 chars): {full_content[:100]}...")
+
+    # 4. Final response using all gathered context
+    prompt = (
+        f"Context from Memory Server:\n"
+        f"- Search Results: {search_results[:200]}...\n"
+        f"- Metadata for {target_id}: {metadata}\n"
+        f"- Original Details: {full_content[:500]}...\n\n"
+        f"User Question: {user_query}"
+    )
     messages = [{"role": "user", "content": prompt}]
     
-    print("[Agent] Thinking...")
+    print("\n[Agent] Final Thinking...")
     answer = await agent.chat(messages)
     print(f"\nAI Answer: {answer}")
 

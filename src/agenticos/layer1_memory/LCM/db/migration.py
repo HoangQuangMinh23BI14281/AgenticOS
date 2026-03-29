@@ -26,8 +26,8 @@ _CORE_SCHEMA = """
         session_key TEXT,
         title TEXT,
         bootstrapped_at TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -38,7 +38,7 @@ _CORE_SCHEMA = """
         role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
         content TEXT NOT NULL,
         token_count INTEGER NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
         UNIQUE (conversation_id, seq)
     );
 
@@ -56,7 +56,7 @@ _CORE_SCHEMA = """
         descendant_token_count INTEGER NOT NULL DEFAULT 0,
         source_message_token_count INTEGER NOT NULL DEFAULT 0,
         model TEXT NOT NULL DEFAULT 'unknown',
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
         file_ids TEXT NOT NULL DEFAULT '[]'
     );
 
@@ -100,10 +100,8 @@ _CORE_SCHEMA = """
     );
 
     CREATE TABLE IF NOT EXISTS summary_messages (
-        summary_id TEXT NOT NULL
-            REFERENCES summaries(summary_id) ON DELETE CASCADE,
-        message_id INTEGER NOT NULL
-            REFERENCES messages(message_id) ON DELETE RESTRICT,
+        summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+        message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
         ordinal INTEGER NOT NULL,
         PRIMARY KEY (summary_id, message_id)
     );
@@ -112,7 +110,7 @@ _CORE_SCHEMA = """
         summary_id TEXT NOT NULL
             REFERENCES summaries(summary_id) ON DELETE CASCADE,
         parent_summary_id TEXT NOT NULL
-            REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+            REFERENCES summaries(summary_id) ON DELETE CASCADE,
         ordinal INTEGER NOT NULL,
         PRIMARY KEY (summary_id, parent_summary_id)
     );
@@ -123,10 +121,10 @@ _CORE_SCHEMA = """
         ordinal INTEGER NOT NULL,
         item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
         message_id INTEGER
-            REFERENCES messages(message_id) ON DELETE RESTRICT,
+            REFERENCES messages(message_id) ON DELETE CASCADE,
         summary_id TEXT
-            REFERENCES summaries(summary_id) ON DELETE RESTRICT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            REFERENCES summaries(summary_id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
         PRIMARY KEY (conversation_id, ordinal),
         CHECK (
             (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL) OR
@@ -143,7 +141,7 @@ _CORE_SCHEMA = """
         byte_size INTEGER,
         storage_uri TEXT NOT NULL,
         exploration_summary TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
     );
 
     CREATE TABLE IF NOT EXISTS conversation_bootstrap_state (
@@ -154,7 +152,7 @@ _CORE_SCHEMA = """
         last_seen_mtime_ms INTEGER NOT NULL,
         last_processed_offset INTEGER NOT NULL,
         last_processed_entry_hash TEXT,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
     );
 
     -- Indexes
@@ -206,24 +204,16 @@ def _ensure_column(
 # ── Backfill Functions ────────────────────────────────────────────────────────
 
 
-def _parse_timestamp(value: str | None) -> datetime | None:
-    """Parse an ISO timestamp string into a datetime."""
-    if not value or not value.strip():
-        return None
-    for fmt in (
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-    ):
-        try:
-            return datetime.strptime(value.strip(), fmt).replace(
-                tzinfo=timezone.utc
-            )
-        except ValueError:
-            continue
-    return None
+def _parse_dt(value: str | None) -> datetime:
+    """Parse an ISO timestamp string, defaulting to UTC now."""
+    if not value:
+        return datetime.now(timezone.utc)
+    try:
+        # Đảm bảo luôn có tzinfo kể cả khi chuỗi naive
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return datetime.now(timezone.utc)
 
 
 def _iso_or_none(dt: datetime | None) -> str | None:
@@ -347,6 +337,7 @@ def _backfill_summary_metadata(conn: sqlite3.Connection) -> None:
             (conv_id,),
         ).fetchall()
 
+        leaf_range_SUMMARY_COLS = "summary_id, conversation_id, kind, depth, content, token_count, file_ids, earliest_at, latest_at, descendant_count, descendant_token_count, source_message_token_count, model, created_at"
         leaf_range_map = {
             r["summary_id"]: {
                 "earliest": r["earliest_at"],
@@ -381,13 +372,13 @@ def _backfill_summary_metadata(conn: sqlite3.Connection) -> None:
 
         for s in summaries:
             sid = s["summary_id"]
-            fallback = _parse_timestamp(s["created_at"])
+            fallback = _parse_dt(s["created_at"])
 
             if s["kind"] == "leaf":
                 lr = leaf_range_map.get(sid)
                 meta[sid] = {
-                    "earliest": _parse_timestamp(lr["earliest"] if lr else s["created_at"]) or fallback,
-                    "latest": _parse_timestamp(lr["latest"] if lr else s["created_at"]) or fallback,
+                    "earliest": _parse_dt(lr["earliest"] if lr else s["created_at"]) or fallback,
+                    "latest": _parse_dt(lr["latest"] if lr else s["created_at"]) or fallback,
                     "desc_count": 0,
                     "desc_tokens": 0,
                     "src_tokens": max(0, lr["src_tokens"]) if lr else 0,
@@ -462,6 +453,7 @@ def _backfill_tool_call_columns(conn: sqlite3.Connection) -> None:
 
     Covers legacy rows where tool info was only stored in metadata.
     """
+    # 1. Backfill tool_call_id
     conn.execute("""
         UPDATE message_parts
         SET tool_call_id = COALESCE(
@@ -482,6 +474,7 @@ def _backfill_tool_call_columns(conn: sqlite3.Connection) -> None:
           ) IS NOT NULL
     """)
 
+    # 2. Backfill tool_name
     conn.execute("""
         UPDATE message_parts
         SET tool_name = COALESCE(
@@ -500,6 +493,7 @@ def _backfill_tool_call_columns(conn: sqlite3.Connection) -> None:
           ) IS NOT NULL
     """)
 
+    # 3. Backfill tool_input
     conn.execute("""
         UPDATE message_parts
         SET tool_input = COALESCE(
@@ -552,6 +546,9 @@ def _setup_fts5(conn: sqlite3.Connection) -> None:
                 tokenize='porter unicode61'
             )
         """)
+        conn.execute(
+            "INSERT INTO messages_fts (rowid, content) SELECT message_id, content FROM messages"
+        )
 
     # Summaries FTS
     summaries_fts = conn.execute(
@@ -581,7 +578,47 @@ def _setup_fts5(conn: sqlite3.Connection) -> None:
             "SELECT summary_id, content FROM summaries"
         )
 
-    logger.debug("FTS5 tables configured")
+    # Trigger cho messages_fts (Standard FTS5 Table)
+    conn.executescript("""
+        CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages
+        BEGIN
+            INSERT INTO messages_fts (rowid, content) VALUES (new.message_id, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages
+        BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.message_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages
+        BEGIN
+            UPDATE messages_fts 
+            SET content = new.content 
+            WHERE rowid = new.message_id;
+        END;
+    """)
+
+    # Trigger cho summaries_fts
+    conn.executescript("""
+        CREATE TRIGGER IF NOT EXISTS summaries_ai AFTER INSERT ON summaries
+        BEGIN
+            INSERT INTO summaries_fts (summary_id, content) VALUES (new.summary_id, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS summaries_ad AFTER DELETE ON summaries
+        BEGIN
+            DELETE FROM summaries_fts WHERE summary_id = old.summary_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS summaries_au AFTER UPDATE ON summaries
+        BEGIN
+            UPDATE summaries_fts 
+            SET content = new.content 
+            WHERE summary_id = new.summary_id;
+        END;
+    """)
+
+    logger.debug("FTS5 tables and triggers configured")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

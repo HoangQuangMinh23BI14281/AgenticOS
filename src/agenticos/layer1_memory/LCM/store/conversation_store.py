@@ -40,7 +40,9 @@ def _parse_dt(value: str | None) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Đảm bảo luôn có tzinfo kể cả khi chuỗi naive
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return datetime.now(timezone.utc)
 
@@ -83,36 +85,6 @@ def _to_part(row: sqlite3.Row) -> MessagePartRecord:
         tool_output=row["tool_output"],
         metadata=row["metadata"],
     )
-
-
-def _normalize_content_for_fts(content: str) -> str | None:
-    """Normalize message content for FTS indexing."""
-    trimmed = content.strip()
-    if not trimmed:
-        return None
-    # Skip externalized file references
-    if trimmed.startswith("[LCM File:") or trimmed.startswith("[LCM Tool Output:"):
-        lines = [l.strip() for l in trimmed.split("\n") if l.strip()]
-        if not lines:
-            return None
-        header = lines[0]
-        summary_lines = []
-        in_summary = False
-        for line in lines[1:]:
-            if line == "Exploration Summary:":
-                in_summary = True
-                continue
-            if line.startswith("Use lcm_describe"):
-                continue
-            if in_summary:
-                summary_lines.append(line)
-        normalized = "\n".join([header] + summary_lines)
-        return normalized if normalized else None
-    return content
-
-
-# ── ConversationStore ─────────────────────────────────────────────────────────
-
 
 class ConversationStore:
     """
@@ -241,7 +213,6 @@ class ConversationStore:
                 (conversation_id, seq, role.value, content, token_count),
             )
             msg_id = cur.lastrowid
-            self._index_fts(conn, msg_id, content)
             conn.commit()
             row = conn.execute(
                 """SELECT message_id, conversation_id, seq, role, content, token_count, created_at
@@ -268,7 +239,6 @@ class ConversationStore:
                     (inp["conversation_id"], inp["seq"], inp["role"], inp["content"], inp["token_count"]),
                 )
                 msg_id = cur.lastrowid
-                self._index_fts(conn, msg_id, inp["content"])
                 row = conn.execute(
                     """SELECT message_id, conversation_id, seq, role, content, token_count, created_at
                        FROM messages WHERE message_id = ?""",
@@ -279,6 +249,22 @@ class ConversationStore:
             return records
 
         return self._pool.execute_write(_bulk)
+
+    def update_message(
+        self,
+        message_id: int,
+        content: str,
+        token_count: int,
+    ) -> None:
+        """Update message content and token count. FTS sync is handled by DB triggers."""
+        def _update(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?",
+                (content, token_count, message_id),
+            )
+            conn.commit()
+
+        self._pool.execute_write(_update)
 
     def get_messages(
         self,
@@ -505,25 +491,6 @@ class ConversationStore:
 
         return self._pool.execute_read(_search)
 
-    # ── FTS helpers ───────────────────────────────────────────────────────
-
-    def _index_fts(
-        self, conn: sqlite3.Connection, message_id: int, content: str
-    ) -> None:
-        """Index a message in FTS5 (best-effort)."""
-        if not self._fts5:
-            return
-        normalized = _normalize_content_for_fts(content)
-        if not normalized:
-            return
-        try:
-            conn.execute(
-                "INSERT INTO messages_fts(rowid, content) VALUES (?, ?)",
-                (message_id, normalized),
-            )
-        except Exception:
-            pass  # FTS indexing is optional
-
     # ── Deletion ──────────────────────────────────────────────────────────
 
     def delete_messages(self, message_ids: list[int]) -> int:
@@ -546,11 +513,6 @@ class ConversationStore:
                     "DELETE FROM context_items WHERE item_type = 'message' AND message_id = ?",
                     (mid,),
                 )
-                if self._fts5:
-                    try:
-                        conn.execute("DELETE FROM messages_fts WHERE rowid = ?", (mid,))
-                    except Exception:
-                        pass
                 conn.execute("DELETE FROM messages WHERE message_id = ?", (mid,))
                 deleted += 1
             conn.commit()

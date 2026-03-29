@@ -67,6 +67,8 @@ class SummarizerTimeoutError(Exception):
 
 def estimate_tokens_fallback(text: str) -> int:
     """Rough fallback estimate (~4 chars/token). Use real tokenizer when available."""
+    if not text:
+        return 0
     return math.ceil(len(text) / 4)
 
 
@@ -299,30 +301,35 @@ def deterministic_fallback_summary(text: str, max_tokens: int = 512) -> str:
 
 def normalize_completion_summary(content: Any) -> str:
     """Extract text safely from provider completion response (supports LiteLLM/OpenAI/Anthropic)."""
+    res = ""
     if isinstance(content, str):
-        return content.strip()
+        res = content.strip()
     
     # Check for .text attribute (CompletionResult or similar)
-    if hasattr(content, "text"):
-        return str(content.text).strip()
+    elif hasattr(content, "text"):
+        res = str(content.text).strip()
     
     # Handle list of blocks (CompletionContentBlock)
-    if isinstance(content, list) and len(content) > 0:
+    elif isinstance(content, list) and len(content) > 0:
         parts = []
         for item in content:
             if hasattr(item, "text"): parts.append(str(item.text))
             elif isinstance(item, str): parts.append(item)
-        return "\n".join(parts).strip()
+        res = "\n".join(parts).strip()
             
-    if isinstance(content, dict):
+    elif isinstance(content, dict):
         for key in ["text", "content", "summary", "response"]:
             if key in content and isinstance(content[key], str):
-                return content[key].strip()
+                res = content[key].strip()
+                break
+    
+    if not res:
+        res = str(content)
 
     # Strip common prompt leaks and role prefixes (Aggressive Cleaning)
     res = re.sub(r"<(/?)(previous_context|conversation_segment|conversation_to_condense|raw_logs)>", "", res, flags=re.I)
     res = re.sub(r"\*\*?(User|Assistant|AI|System|Thinking)\*\*?[:\s-]*", "", res, flags=re.I)
-    res = re.sub(r"^(User|Assistant|AI|System|Thinking)[:\s-]*", "", res, flags=re.I, count=0)
+    res = re.sub(r"^(User|Assistant|AI|System|Thinking)[:\s-]*", "", res, flags=re.I)
     res = re.sub(r"\n(User|Assistant|AI|System|Thinking)[:\s-]*", "\n", res, flags=re.I)
     res = re.sub(r"\[/?(previous_context|summary|context_history)\]", "", res, flags=re.I)
     
@@ -373,29 +380,13 @@ class LcmSummarizer:
         previous_summary: str | None = None,
         is_condensed: bool = False,
         depth: int = 0,
-        custom_instructions: str | None = None, # Thêm tham số này để Expand Tool dùng được
-    ) -> str:
-        """
-        Summarize text using LLM with appropriate prompt.
-        """
-        # Ưu tiên custom_instructions được truyền vào (dùng cho Expand Query)
-        instr = custom_instructions if custom_instructions else self._custom_instructions
-
-    async def summarize(
-        self,
-        text: str,
-        aggressive: bool = False,
-        previous_summary: str | None = None,
-        is_condensed: bool = False,
-        depth: int = 0,
-        custom_instructions: str | None = None, # Thêm tham số này để Expand Tool dùng được
-        mode: str = "summary", # "summary" | "expansion"
+        custom_instructions: str | None = None,
+        mode: str = "summary",
         query: str = ""
     ) -> str:
         """
         Summarize or Expand text using LLM with appropriate prompt.
         """
-        # Ưu tiên custom_instructions được truyền vào (dùng cho Expand Query)
         instr = custom_instructions if custom_instructions else self._custom_instructions
 
         input_tokens = estimate_tokens_fallback(text)
@@ -403,7 +394,7 @@ class LcmSummarizer:
         if mode == "expansion":
             prompt = build_expansion_prompt(text, query, instr)
             system = "You are a high-fidelity retrieval agent. Answer questions accurately based on logs."
-            target_tokens = 2048 # High budget for expansion
+            target_tokens = 2048 
         else:
             target_tokens = resolve_target_tokens(
                 input_tokens, aggressive, is_condensed
@@ -421,15 +412,12 @@ class LcmSummarizer:
                 )
 
         label = f"{mode} {'condensed' if is_condensed else 'leaf'} d={depth}"
-        
-        # In log ra để bạn biết LLM đang được gọi bằng Prompt gì!
         logger.debug(f"[lcm] Calling LLM for {label} - Target: {target_tokens} tok")
 
         try:
             result = await asyncio.wait_for(
                 self._complete(
                     model=self._model,
-                    # Chú ý: Cấu trúc messages chuẩn của API
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": prompt}
@@ -440,18 +428,26 @@ class LcmSummarizer:
                 timeout=self._timeout_s,
             )
             
-            # Xử lý nội dung trả về
-            summary = normalize_completion_summary(
-                result.content if hasattr(result, "content") else result
-            )
+            content = result.content if hasattr(result, "content") else result
+            summary = normalize_completion_summary(content)
             
-            # Cắt bỏ thẻ <think> của Deepseek (nếu có)
             if "</think>" in summary:
                 summary = summary.split("</think>")[-1].strip()
 
             if not summary:
                 logger.warning("[lcm] empty summary from LLM (%s), using fallback", label)
                 return deterministic_fallback_summary(text)
+
+            # --- Token Overflow Guard (Audit Fix) ---
+            summary_tokens = estimate_tokens_fallback(summary)
+            if summary_tokens >= input_tokens * 0.95 and not aggressive:
+                logger.warning(
+                    "[lcm] poor summary compression ratio (in=%d, out=%d). "
+                    "Rejecting summary to prevent context bloating.",
+                    input_tokens, summary_tokens
+                )
+                return "" # Return empty to signal failure to compactor
+            # ----------------------------------------
 
             return summary
 

@@ -18,7 +18,7 @@ from uuid import uuid4
 from .types import CompactionDecision, CompactionResult, SummaryKind, ContextItemType, MessageRole
 from .config import LcmConfig
 from .store import ConversationStore, SummaryStore
-from .summarize import LcmSummarizer
+from .summarize import LcmSummarizer, estimate_tokens_fallback
 
 logger = logging.getLogger("lcm.compaction")
 
@@ -265,11 +265,15 @@ class CompactionEngine:
         summary_id = f"sum_{uuid4().hex[:8]}"
         summary_text = await self._summarizer.summarize(full_text, aggressive=aggressive)
         
+        if not summary_text:
+            logger.info("[lcm] leaf pass: summary rejected by overflow guard. skipping replacement.")
+            return None
+        
         # Đếm token chuẩn
         if self._tokenizer:
             token_count = len(self._tokenizer.encode(summary_text))
         else:
-            token_count = len(summary_text) // 4
+            token_count = estimate_tokens_fallback(summary_text)
             
         total_source_tokens = sum(m.token_count for m in [self._conv_store.get_message_by_id(mid) for mid in message_ids] if m)
         
@@ -366,10 +370,14 @@ class CompactionEngine:
             full_text, aggressive=aggressive, is_condensed=True, depth=new_depth
         )
         
+        if not summary_text:
+            logger.info("[lcm] condensed pass: summary rejected by overflow guard. skipping replacement.")
+            return None
+        
         if self._tokenizer:
             token_count = len(self._tokenizer.encode(summary_text))
         else:
-            token_count = len(summary_text) // 4
+            token_count = estimate_tokens_fallback(summary_text)
             
         self._summary_store.insert_summary(
             summary_id=summary_id,

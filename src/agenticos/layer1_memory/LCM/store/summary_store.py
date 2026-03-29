@@ -47,7 +47,9 @@ def _parse_dt(value: str | None) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Đảm bảo luôn có tzinfo kể cả khi chuỗi naive
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return datetime.now(timezone.utc)
 
@@ -110,11 +112,7 @@ def _to_large_file(row: sqlite3.Row) -> LargeFileRecord:
 
 
 # Summary columns shared across queries
-_SUMMARY_COLS = """
-    summary_id, conversation_id, kind, depth, content, token_count,
-    file_ids, earliest_at, latest_at, descendant_count,
-    descendant_token_count, source_message_token_count, model, created_at
-"""
+_SUMMARY_COLS = "s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count, s.file_ids, s.earliest_at, s.latest_at, s.descendant_count, s.descendant_token_count, s.source_message_token_count, s.model, s.created_at"
 
 
 # ── SummaryStore ──────────────────────────────────────────────────────────────
@@ -225,17 +223,10 @@ class SummaryStore:
                     max(0, source_message_token_count), model,
                 ),
             )
-            if self._fts5:
-                try:
-                    conn.execute(
-                        "INSERT INTO summaries_fts(summary_id, content) VALUES (?, ?)",
-                        (summary_id, clean_content),
-                    )
-                except Exception: pass
             conn.commit()
 
             row = conn.execute(
-                f"SELECT {_SUMMARY_COLS} FROM summaries WHERE summary_id = ?",
+                f"SELECT {_SUMMARY_COLS} FROM summaries s WHERE s.summary_id = ?",
                 (summary_id,),
             ).fetchone()
             return _to_summary(row)
@@ -254,7 +245,7 @@ class SummaryStore:
         # Cache miss — query DB
         def _get(conn: sqlite3.Connection) -> SummaryRecord | None:
             row = conn.execute(
-                f"SELECT {_SUMMARY_COLS} FROM summaries WHERE summary_id = ?",
+                f"SELECT { _SUMMARY_COLS } FROM summaries s WHERE s.summary_id = ?",
                 (summary_id,),
             ).fetchone()
             return _to_summary(row) if row else None
@@ -269,7 +260,7 @@ class SummaryStore:
     ) -> list[SummaryRecord]:
         def _get(conn: sqlite3.Connection) -> list[SummaryRecord]:
             rows = conn.execute(
-                f"SELECT {_SUMMARY_COLS} FROM summaries WHERE conversation_id = ? ORDER BY created_at",
+                f"SELECT { _SUMMARY_COLS } FROM summaries AS s WHERE s.conversation_id = ? ORDER BY s.created_at",
                 (conversation_id,),
             ).fetchall()
             return [_to_summary(r) for r in rows]
@@ -389,8 +380,7 @@ class SummaryStore:
             return cached
 
         def _get(conn: sqlite3.Connection) -> list[SummarySubtreeNode]:
-            rows = conn.execute(
-                """WITH RECURSIVE subtree(summary_id, parent_summary_id, depth_from_root, path) AS (
+            sql = f"""WITH RECURSIVE subtree(summary_id, parent_summary_id, depth_from_root, path) AS (
                        SELECT ?, NULL, 0, ''
                        UNION ALL
                        SELECT sp.summary_id, sp.parent_summary_id,
@@ -402,20 +392,16 @@ class SummaryStore:
                        FROM summary_parents sp
                        JOIN subtree ON sp.parent_summary_id = subtree.summary_id
                    )
-                   SELECT s.summary_id, s.conversation_id, s.kind, s.depth,
-                          s.content, s.token_count, s.file_ids,
-                          s.earliest_at, s.latest_at, s.descendant_count,
-                          s.descendant_token_count, s.source_message_token_count,
-                          s.model, s.created_at,
+                   SELECT { _SUMMARY_COLS },
                           subtree.depth_from_root, subtree.parent_summary_id,
                           subtree.path,
                           (SELECT COUNT(*) FROM summary_parents sp2
                            WHERE sp2.parent_summary_id = s.summary_id) AS child_count
                    FROM subtree
                    JOIN summaries s ON s.summary_id = subtree.summary_id
-                   ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC""",
-                (summary_id,),
-            ).fetchall()
+                   ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC"""
+            
+            rows = conn.execute(sql, (summary_id,)).fetchall()
 
             node_map: dict[str, SummarySubtreeNode] = {}
             for r in rows:
@@ -524,21 +510,13 @@ class SummaryStore:
                     "INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id) VALUES (?, ?, 'summary', ?)",
                     (conversation_id, start_ordinal, summary_id),
                 )
-                # Resequence: fetch all, temp-negate, then reassign
-                items = conn.execute(
-                    "SELECT ordinal FROM context_items WHERE conversation_id = ? ORDER BY ordinal",
-                    (conversation_id,),
-                ).fetchall()
-
-                for i, item in enumerate(items):
+                # 3. Resequence O(1) SQL Optimization (Audit Fix)
+                # Tính toán khoảng cách (offset = số lượng items bị xóa - 1)
+                offset = end_ordinal - start_ordinal
+                if offset > 0:
                     conn.execute(
-                        "UPDATE context_items SET ordinal = ? WHERE conversation_id = ? AND ordinal = ?",
-                        (-(i + 1), conversation_id, item["ordinal"]),
-                    )
-                for i in range(len(items)):
-                    conn.execute(
-                        "UPDATE context_items SET ordinal = ? WHERE conversation_id = ? AND ordinal = ?",
-                        (i, conversation_id, -(i + 1)),
+                        "UPDATE context_items SET ordinal = ordinal - ? WHERE conversation_id = ? AND ordinal > ?",
+                        (offset, conversation_id, start_ordinal),
                     )
                 conn.execute("COMMIT")
             except Exception:

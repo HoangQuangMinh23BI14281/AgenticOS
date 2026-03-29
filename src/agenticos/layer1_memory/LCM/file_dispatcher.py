@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .config import LcmConfig
 from .store import ConversationStore, SummaryStore
-from .summarize import LcmSummarizer
+from .summarize import LcmSummarizer, estimate_tokens_fallback
 
 logger = logging.getLogger("lcm.file_dispatcher")
 
@@ -91,24 +91,12 @@ class FileDispatcher:
                 f"Use `lcm_expand` on {file_id} if you absolutely need the massive raw contents."
             )
             
-            # Update the DB (this bypasses standard store CRUD for simplicity in python port, 
-            # ideally would have an update_message in Store)
-            new_tokens = len(new_content) // 4 # Mock tokenizer for replacement
+            # Update the DB via official Store method
+            new_tokens = estimate_tokens_fallback(new_content)
+            self._conv_store.update_message(msg_id, new_content, new_tokens)
             
-            def _update_msg(conn):
-                conn.execute(
-                    "UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?",
-                    (new_content, new_tokens, msg_id)
-                )
-                if self._conv_store._fts5:
-                    try:
-                        conn.execute("UPDATE messages_fts SET content = ? WHERE rowid = ?",
-                                     (new_content, msg_id))
-                    except Exception:
-                        pass
-                conn.commit()
-                
-            self._conv_store._pool.execute_write(_update_msg)
             externalized_count += 1
+            
+        return externalized_count
             
         return externalized_count

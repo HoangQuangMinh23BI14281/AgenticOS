@@ -1,72 +1,183 @@
-# HƯỚNG DẪN CHI TIẾT WORKFLOW CỦA LCM (AgenticOS)
+# Lossless Context Management (LCM) - Technical Specification
 
-Tài liệu này giải thích chi tiết **Cách thức hoạt động (Workflow)** và **Kiến trúc (Architecture)** thực tế của module **Lossless Context Management (LCM)** được viết bằng Python thuần trong hệ sinh thái AgenticOS. Mọi thứ được thiết kế để giải quyết bài toán: *Làm sao để Agent có trí nhớ vô hạn mà không bao giờ bị tràn RAM, chậm máy hay mất dữ liệu.*
-
----
-
-## PHẦN 1: HỆ QUẢN TRỊ CƠ SỞ DỮ LIỆU (THE IMMUTABLE STORE)
-
-Khác với các chatbot thông thường lưu lịch sử bằng "mảng" (array) trên RAM, LCM dùng **SQLite (với WAL Mode)** làm bộ nhớ vĩnh cửu.
-
-### 1. Kiến trúc Bảng (Schema)
-Dữ liệu được chia làm 3 bảng cốt lõi để đảm bảo không dư thừa:
-1.  **`messages` (Dữ liệu thô - Bất biến):** Lưu 100% nội dung gốc của `user` và `assistant`, kèm số đếm `token_count`. Nội dung ở đây **không bao giờ bị xóa hay sửa**.
-2.  **`summaries` (Mạng lưới nén DAG):** Lưu các phiên bản đã nén của lịch sử (Summary). Hỗ trợ nén đa tầng (Depth 0, 1, 2...). Nếu hệ thống bị lỗi mạng khi gọi LLM (như bạn vừa gặp), nó sẽ lưu chuỗi cảnh báo `[Truncated - oldest context removed]` vào đây.
-3.  **`context_items` (Con trỏ/Sơ đồ):** Bảng này **không chứa nội dung chữ**. Nó chỉ lưu các "con trỏ" ID (`message_id` hoặc `summary_id`) và thứ tự (`ordinal`) của những gì *đang được bật* trong cửa sổ ngữ cảnh hiện tại.
-
-### 2. Thuật toán "Connection Pool"
-Để tránh lỗi `[Errno database is locked]` khi Agent vừa chat vừa nén dữ liệu ngầm, LCM thiết kế một `ConnectionPool`:
--   **Write (Ghi):** Bị khóa chốt (Thread Lock), chỉ 1 tiến trình được phép ghi vào DB tại một thời điểm.
--   **Read (Đọc):** Cho phép hàng loạt tiến trình đọc cùng lúc nhờ cơ chế `WAL Mode` của SQLite.
+Lossless Context Management (LCM) is the core memory architecture of AgenticOS, designed to provide LLMs with a "permanent memory" that scales indefinitely while maintaining 100% data integrity on edge devices.
 
 ---
 
-## PHẦN 2: ĐỘNG CƠ KIỂM SOÁT NGỮ CẢNH (CONTEXT ENGINE LOOP)
+## 1. System Architecture
 
-Đây là vòng lặp xương sống chạy mỗi khi người dùng gửi 1 tin nhắn.
+LCM is structured into four distinct horizontal layers, ensuring separation of concerns between storage persistence and high-level agent interaction.
 
-### 1. Nạp tin nhắn mới (Ingestion)
-Khi chạy `engine.ingest_message()`, tin nhắn lập tức được lưu vào bảng `messages` và bảng `context_items` để Agent có thể nhìn thấy nó.
+```mermaid
+graph TD
+    subgraph Access_Layer [Access & Protocol]
+        MCP[lcm_mcp.py]
+        Tools[tools/ folder]
+    end
 
-### 2. Lắp ráp Ngữ cảnh (Assembly) & Bindle
-Khi chạy `engine.assemble()`, LCM quét qua bảng `context_items` để trộn lại thành chuỗi Text đưa cho AI. Ở đây có khái niệm cực kỳ quan trọng:
-*   **Bindle (Gói mang theo):** Là các Summary/Message đang nằm trong chuỗi `active`. LCM sẽ nạp chúng lên đầu prompt thông qua một thẻ `<lcm_metadata>`, báo cho AI biết "Bạn đang có các gói tin này trong tay".
-*   **Archive Stub (Lưu trữ sâu):** Là những Summary quá cũ, đã bị "đẩy" ra khỏi cửa sổ hiện tại (nằm trong DB nhưng không có trong `context_items`).
+    subgraph Engine_Layer [Intelligence & Control]
+        Engine[engine.py]
+        Compactor[compaction.py]
+        Summarizer[summarize.py]
+    end
 
-### 3. Vòng bảo vệ Context (Compaction Thresholding)
-Thay vì chờ cửa sổ ngữ cảnh vỡ bục (VD: 32K tokens) mới nén, LCM được thiết lập ngưỡng `context_threshold = 0.55` (Nén từ sớm khi mới đầy 55%). Điều này giúp Agent không bao giờ mắc bệnh "Lost in the Middle" (Quên thông tin ở giữa).
+    subgraph Store_Layer [Logic & Caching]
+        ConvStore[conversation_store.py]
+        SumStore[summary_store.py]
+        FTS[fts5_sanitize.py]
+    end
 
----
+    subgraph DB_Layer [Persistence]
+        Conn[connection.py]
+        Migrator[migration.py]
+        SQLite[(stress_test.db)]
+    end
 
-## PHẦN 3: LEO THANG 3 CẤP ĐỘ KHI NÉN (3-LEVEL ESCALATION)
-
-Khi tổng Token vượt ngưỡng, Engine kích hoạt hệ thống **Compaction** chạy ngầm. Để đảm bảo không bao giờ Crash hệ thống ngay cả khi LLM hư, mất mạng (như lỗi Ollama Offline), việc nén diễn ra qua 3 bước:
-
-1.  **Level 1 (LLM Summarization):** Gọi LLM (VD: `deepseek-r1:1.5b`) đọc lịch sử cũ và "nhai" lại thành 1 đoạn tóm tắt ngắn nhưng không mất chi tiết quan trọng.
-2.  **Level 2 (Strict Bullet Points):** Nếu Level 1 thất bại (LLM trả về câu quá dài hơn cả bản gốc), bắt buộc LLM tóm tắt bằng Gạch đầu dòng siêu ngắn.
-3.  **Level 3 (Deterministic Fallback):** Nếu mạng rớt (Timeout) hoặc Ollama tắt định tuyến, code Python sẽ tự ra tay **"Trảm"** (cắt bỏ thô bạo đoạn text đuôi và nhét vào chữ `[Truncated - oldest context removed]`).
-    *   *Đây là tính năng Bảo vệ sinh tồn (Safety Mechanism), giữ cho hệ thống chạy tiếp thay vì chết đứng tung lỗi 500.*
-
----
-
-## PHẦN 4: CÔNG CỤ ĐỌC BỘ NHỚ (MEMORY-ACCESS TOOLS)
-
-Làm sao AI đọc lại được dữ liệu cũ nếu nó đã bị biến thành Bindle hoặc Archive? LCM cấp cho Agent 3 cái Tools (Function Calling):
-
-1.  **`lcm_grep (pattern)`:** 
-    Sử dụng công cụ tìm kiếm siêu tốc **FTS5** (Full-text Search engine ảo của SQLite) để tìm lại từ khóa chính xác từ toàn bộ các tin nhắn thô ở quá khứ.
-2.  **`lcm_describe (id)`:** 
-    Giải thích cho Agent biết Summary X này thực chất đang bọc bao nhiêu tin nhắn thô bên trong, nó là đồ mang theo trên người (Bindle) hay bị cất trong tủ (Archive).
-3.  **`lcm_expand (summary_id)`:** 
-    Công cụ mạnh nhất — **"Bung nén"**. Nó dùng SQL Đệ quy (Recursive CTEs) để gỡ rối DAG Network, lôi đúng 100% nguyên văn (Verbatim) những gì đã bị nén ra cho Agent đọc.
-    *   *Quy luật thép:* Tránh để Agent gốc bung nén một cục dữ liệu 100.000 tokens tự đánh sập context của chính nó. Thường chỉ Agent con (Sub-agent) mới được cấp quyền gọi Tool này.
+    Access_Layer <--> Engine_Layer
+    Engine_Layer <--> Store_Layer
+    Store_Layer <--> DB_Layer
+```
 
 ---
 
-## TỔNG KẾT VÒNG LẶP SỰ SỐNG CỦA MỘT TIN NHẮN
+## 2. Physical Data Model (Database Schema)
 
-1.  **Sinh ra:** Bạn chat "Xin chào".
-2.  **Ghi chép:** LCM lẳng lặng khắc nó vào đá (SQLite bảng `messages` & `context_items`).
-3.  **Căng phồng:** Cuộc hội thoại kéo dài 5 tiếng, Token lên mốc báo động (55%).
-4.  **Siết chặt:** Hệ thống ngầm gọi Ollama, nhóm 50 tin nhắn cũ lại thành 1 Summary (lưu vào bảng `summaries`), cập nhật lại `context_items`.
-5.  **Bất tử:** Chữ của bạn vĩnh viễn không mất đi (Lossless), nó chỉ lùi sâu xuống cây DAG. Khi cần thiết, Agent bấm nút `lcm_expand` là nó lại hiện nguyên hình y như cũ.
+LCM utilizes a sophisticated 9-table schema in SQLite (managed by `migration.py`) to handle multi-modal message parts and recursive summary structures.
+
+```mermaid
+erDiagram
+    conversations ||--o{ messages : "defines history"
+    conversations ||--o{ summaries : "has compressed nodes"
+    conversations ||--o{ context_items : "active window"
+    conversations ||--o{ large_files : "external assets"
+    conversations ||--|| conversation_bootstrap_state : "tracking"
+
+    messages ||--o{ message_parts : "fragmented into"
+    messages ||--o{ summary_messages : "source for (CASCADE)"
+
+    summaries ||--o{ summary_messages : "aggregates (CASCADE)"
+    summaries ||--o{ summary_parents : "as_child (CASCADE)"
+    summaries ||--o{ summary_parents : "as_parent (CASCADE)"
+    summaries ||--o{ context_items : "referenced_by"
+
+    conversations {
+        int conversation_id PK
+        string session_id
+        string session_key "unique"
+        string title
+        datetime created_at
+    }
+
+    messages {
+        int message_id PK
+        int conversation_id FK
+        int seq "unique_per_conv"
+        string role "user/assistant/system/tool"
+        text content
+        int token_count
+    }
+
+    message_parts {
+        string part_id PK
+        int message_id FK
+        string part_type "text/reasoning/tool/patch/file/etc"
+        int ordinal "seq_in_message"
+        text text_content
+        text metadata "JSON_blobs"
+    }
+
+    summaries {
+        string summary_id PK
+        int conversation_id FK
+        string kind "leaf/condensed"
+        int depth "DAG_level"
+        text content "cleaned_summary"
+        int token_count
+        int source_message_token_count
+        string model "generator_model"
+    }
+
+    summary_messages {
+        string summary_id PK, FK "CASCADE ON DELETE"
+        int message_id PK, FK "CASCADE ON DELETE"
+        int ordinal
+    }
+
+    summary_parents {
+        string summary_id PK, FK "CASCADE ON DELETE"
+        string parent_summary_id PK, FK "CASCADE ON DELETE"
+        int ordinal
+    }
+
+    context_items {
+        int conversation_id PK, FK
+        int ordinal PK
+        string item_type "message/summary"
+        int message_id FK
+        string summary_id FK
+    }
+
+    large_files {
+        string file_id PK
+        int conversation_id FK
+        string storage_uri
+        string file_name
+        int byte_size
+        text exploration_summary
+    }
+
+    conversation_bootstrap_state {
+        int conversation_id PK, FK
+        string session_file_path
+        int last_processed_offset
+        int last_seen_size
+    }
+```
+
+### 2.1 Core Tables Breakdown
+*   **`conversations`**: Tracks sessions, titles, and bootstrap states.
+*   **`messages`**: Source of truth for raw dialogue. Immutable once written.
+*   **`message_parts`**: Highly granular storage for different content types (Text, Reasoning, Tool Calls, Patches, Files, etc.). Supports 13+ specialized part types.
+*   **`summaries`**: Stores the compressed Nodes. Attributes include `depth` (DAG level), `token_count`, and `source_message_token_count`.
+*   **`context_items`**: The "Active Window" pointer table. Determines what is currently visible to the LLM.
+*   **`large_files`**: Registry for files externalized from the context to save VRAM.
+
+### 2.2 Relation & DAG Tables
+*   **`summary_messages`**: Links Summary Nodes to their original Raw Messages.
+*   **`summary_parents`**: The backbone of the **Recursive DAG**. Links child summaries to parent summaries, enabling multi-level "zooming."
+
+---
+
+## 3. Compaction Lifecycle (3-Level Defense)
+
+The `CompactionEngine` in `compaction.py` prevents "Context Rot" by triggering background compression when tokens exceed **55% of the budget**.
+
+### The Escalation Strategy:
+1.  **Level 1: Synthesis (Standard)**: Uses a small LLM to synthesize a logical summary of the oldest block in the window.
+2.  **Level 2: Point Extraction (Aggressive)**: Triggered if Level 1 fails to reduce tokens significantly. Forces the LLM to output ultra-dense bullet points.
+3.  **Level 3: Deterministic Truncation (Safety Fallback)**: A pure Python logic that "chops" the oldest items to guarantee context window recovery, ensuring the system never crashes due to LLM failure.
+
+> [!TIP]
+> **QA Protection (Fresh Tail Logic)**: LCM always preserves at least 6 messages (3 Q&A pairs) at the end of the history to maintain immediate conversation coherence, even during aggressive compaction.
+
+---
+
+## 4. Advanced Memory Access Tools
+
+Agents interact with deep history via a set of specialized tools that bypass the active context window.
+
+| Tool | Source | Logic |
+| :--- | :--- | :--- |
+| **`lcm_grep`** | `tools/lcm_grep.py` | Uses **SQLite FTS5** (Porter stemmer + unicode61) for sub-millisecond keyword searches across all history. |
+| **`lcm_describe`** | `tools/lcm_describe.py` | Provides metadata about a Summary Node (timeframe, count, depth) so the Agent can decide if it needs to see the full content. |
+| **`lcm_expand`** | `tools/lcm_expand.py` | Uses **Recursive Common Table Expressions (CTEs)** to drill down to the original raw verbatim messages. |
+
+---
+
+## 5. Technical Philosophies
+
+*   **Verbatim Recall**: Unlike RAG (which returns slices), LCM's `expand` tool returns the *exact* original conversation turn, ensuring logic isn't lost in translation.
+*   **Prompt Leakage Sanitization**: `summary_store.py` includes a `_sanitize_content` filter that strips internal XML tags (like `<think>`, `<previous_context>`) before saving to DB, preventing meta-prompts from infecting the history.
+
+---
+*Implementation Version: Python-native (Ported from TypeScript/lossless-claw)*
