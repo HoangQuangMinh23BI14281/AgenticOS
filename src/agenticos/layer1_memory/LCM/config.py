@@ -182,148 +182,53 @@ def resolve_lcm_config(
     """
     pc = plugin_config or {}
 
-    return LcmConfig(
-        enabled=_first(_env_bool("LCM_ENABLED"), _pc_bool(pc, "enabled"), True),
+    def _resolve(env_key: str, pc_keys: list[str], default: Any, type_fn: Any) -> Any:
+        # 1. Env
+        env_val = os.environ.get(env_key)
+        if env_val is not None:
+            if type_fn == _env_bool: return _env_bool(env_key)
+            if type_fn == _env_int: return _env_int(env_key)
+            if type_fn == _env_float: return _env_float(env_key)
+            if type_fn == _env_str_list: return _env_str_list(env_key)
+            return _env_str(env_key)
+        # 2. Plugin Config
+        for k in pc_keys:
+            val = pc.get(k)
+            if val is not None:
+                if type_fn == _env_bool: return _pc_bool(pc, k)
+                if type_fn == _env_int: return _pc_int(pc, k)
+                if type_fn == _env_float: return _pc_float(pc, k)
+                return _pc_str(pc, k)
+        return default
 
+    return LcmConfig(
+        enabled=_resolve("LCM_ENABLED", ["enabled"], True, _env_bool),
         database_path=(
             _env_str("LCM_DATABASE_PATH")
             or _pc_str(pc, "dbPath", "databasePath")
             or str(Path.home() / ".agenticos" / "lcm.db")
         ),
-
-        ignore_session_patterns=(
-            _env_str_list("LCM_IGNORE_SESSION_PATTERNS")
-            or pc.get("ignoreSessionPatterns", [])
-        ),
-
-        stateless_session_patterns=(
-            _env_str_list("LCM_STATELESS_SESSION_PATTERNS")
-            or pc.get("statelessSessionPatterns", [])
-        ),
-
-        skip_stateless_sessions=_first(
-            _env_bool("LCM_SKIP_STATELESS_SESSIONS"),
-            _pc_bool(pc, "skipStatelessSessions"),
-            True,
-        ),
-
-        context_threshold=_first(
-            _env_float("LCM_CONTEXT_THRESHOLD"),
-            _pc_float(pc, "contextThreshold"),
-            0.55,
-        ),
-
-        fresh_tail_count=_first(
-            _env_int("LCM_FRESH_TAIL_COUNT"),
-            _pc_int(pc, "freshTailCount"),
-            32,
-        ),
-
-        leaf_min_fanout=_first(
-            _env_int("LCM_LEAF_MIN_FANOUT"),
-            _pc_int(pc, "leafMinFanout"),
-            8,
-        ),
-
-        condensed_min_fanout=_first(
-            _env_int("LCM_CONDENSED_MIN_FANOUT"),
-            _pc_int(pc, "condensedMinFanout"),
-            4,
-        ),
-
-        condensed_min_fanout_hard=_first(
-            _env_int("LCM_CONDENSED_MIN_FANOUT_HARD"),
-            _pc_int(pc, "condensedMinFanoutHard"),
-            2,
-        ),
-
-        incremental_max_depth=_first(
-            _env_int("LCM_INCREMENTAL_MAX_DEPTH"),
-            _pc_int(pc, "incrementalMaxDepth"),
-            0,
-        ),
-
-        leaf_chunk_tokens=_first(
-            _env_int("LCM_LEAF_CHUNK_TOKENS"),
-            _pc_int(pc, "leafChunkTokens"),
-            20_000,
-        ),
-
-        leaf_target_tokens=_first(
-            _env_int("LCM_LEAF_TARGET_TOKENS"),
-            _pc_int(pc, "leafTargetTokens"),
-            1_200,
-        ),
-
-        condensed_target_tokens=_first(
-            _env_int("LCM_CONDENSED_TARGET_TOKENS"),
-            _pc_int(pc, "condensedTargetTokens"),
-            2_000,
-        ),
-
-        max_expand_tokens=_first(
-            _env_int("LCM_MAX_EXPAND_TOKENS"),
-            _pc_int(pc, "maxExpandTokens"),
-            4_000,
-        ),
-
-        large_file_token_threshold=_first(
-            _env_int("LCM_LARGE_FILE_TOKEN_THRESHOLD"),
-            _pc_int(pc, "largeFileThresholdTokens", "largeFileTokenThreshold"),
-            25_000,
-        ),
-
-        summary_provider=(
-            _env_str("LCM_SUMMARY_PROVIDER")
-            or _pc_str(pc, "summaryProvider")
-            or ""
-        ),
-
-        summary_model=(
-            _env_str("LCM_SUMMARY_MODEL")
-            or _pc_str(pc, "summaryModel")
-            or ""
-        ),
-
-        large_file_summary_provider=(
-            _env_str("LCM_LARGE_FILE_SUMMARY_PROVIDER")
-            or _pc_str(pc, "largeFileSummaryProvider")
-            or ""
-        ),
-
-        large_file_summary_model=(
-            _env_str("LCM_LARGE_FILE_SUMMARY_MODEL")
-            or _pc_str(pc, "largeFileSummaryModel")
-            or ""
-        ),
-
-        expansion_provider=(
-            _env_str("LCM_EXPANSION_PROVIDER")
-            or _pc_str(pc, "expansionProvider")
-            or ""
-        ),
-
-        expansion_model=(
-            _env_str("LCM_EXPANSION_MODEL")
-            or _pc_str(pc, "expansionModel")
-            or ""
-        ),
-
-        autocompact_disabled=_first(
-            _env_bool("LCM_AUTOCOMPACT_DISABLED"),
-            _pc_bool(pc, "autocompactDisabled"),
-            False,
-        ),
-
-        timezone=(
-            os.environ.get("TZ", "").strip()
-            or _pc_str(pc, "timezone")
-            or "UTC"
-        ),
-
-        prune_heartbeat_ok=_first(
-            _env_bool("LCM_PRUNE_HEARTBEAT_OK"),
-            _pc_bool(pc, "pruneHeartbeatOk"),
-            False,
-        ),
+        ignore_session_patterns=_resolve("LCM_IGNORE_SESSION_PATTERNS", ["ignoreSessionPatterns"], [], _env_str_list),
+        stateless_session_patterns=_resolve("LCM_STATELESS_SESSION_PATTERNS", ["statelessSessionPatterns"], [], _env_str_list),
+        skip_stateless_sessions=_resolve("LCM_SKIP_STATELESS_SESSIONS", ["skipStatelessSessions"], True, _env_bool),
+        context_threshold=_resolve("LCM_CONTEXT_THRESHOLD", ["contextThreshold"], 0.55, _env_float),
+        fresh_tail_count=_resolve("LCM_FRESH_TAIL_COUNT", ["freshTailCount"], 32, _env_int),
+        leaf_min_fanout=_resolve("LCM_LEAF_MIN_FANOUT", ["leafMinFanout"], 8, _env_int),
+        condensed_min_fanout=_resolve("LCM_CONDENSED_MIN_FANOUT", ["condensedMinFanout"], 4, _env_int),
+        condensed_min_fanout_hard=_resolve("LCM_CONDENSED_MIN_FANOUT_HARD", ["condensedMinFanoutHard"], 2, _env_int),
+        incremental_max_depth=_resolve("LCM_INCREMENTAL_MAX_DEPTH", ["incrementalMaxDepth"], 0, _env_int),
+        leaf_chunk_tokens=_resolve("LCM_LEAF_CHUNK_TOKENS", ["leafChunkTokens"], 20_000, _env_int),
+        leaf_target_tokens=_resolve("LCM_LEAF_TARGET_TOKENS", ["leafTargetTokens"], 1_200, _env_int),
+        condensed_target_tokens=_resolve("LCM_CONDENSED_TARGET_TOKENS", ["condensedTargetTokens"], 2_000, _env_int),
+        max_expand_tokens=_resolve("LCM_MAX_EXPAND_TOKENS", ["maxExpandTokens"], 4_000, _env_int),
+        large_file_token_threshold=_resolve("LCM_LARGE_FILE_TOKEN_THRESHOLD", ["largeFileThresholdTokens", "largeFileTokenThreshold"], 25_000, _env_int),
+        summary_provider=_resolve("LCM_SUMMARY_PROVIDER", ["summaryProvider"], "", _env_str),
+        summary_model=_resolve("LCM_SUMMARY_MODEL", ["summaryModel"], "", _env_str),
+        large_file_summary_provider=_resolve("LCM_LARGE_FILE_SUMMARY_PROVIDER", ["largeFileSummaryProvider"], "", _env_str),
+        large_file_summary_model=_resolve("LCM_LARGE_FILE_SUMMARY_MODEL", ["largeFileSummaryModel"], "", _env_str),
+        expansion_provider=_resolve("LCM_EXPANSION_PROVIDER", ["expansionProvider"], "", _env_str),
+        expansion_model=_resolve("LCM_EXPANSION_MODEL", ["expansionModel"], "", _env_str),
+        autocompact_disabled=_resolve("LCM_AUTOCOMPACT_DISABLED", ["autocompactDisabled"], False, _env_bool),
+        timezone=(os.environ.get("TZ", "").strip() or _pc_str(pc, "timezone") or "UTC"),
+        prune_heartbeat_ok=_resolve("LCM_PRUNE_HEARTBEAT_OK", ["pruneHeartbeatOk"], False, _env_bool),
     )

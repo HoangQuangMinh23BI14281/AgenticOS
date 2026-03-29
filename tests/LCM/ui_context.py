@@ -9,17 +9,20 @@ JS_PART = """
         let ctxHtml = '';
         if (data.active_summaries) {
             data.active_summaries.forEach(s => {
-                ctxHtml += `<div class="card summary-card">
-                    <div style="color:var(--color-d1); font-weight:700; font-size:11px; margin-bottom:8px;">SUMMARY D${s.depth} | ${s.id}</div>
-                    <div style="color:var(--text-main);">${s.content}</div>
+                ctxHtml += `<div class="summary-capsule">
+                    <div style="font-weight:800; font-size:10px; margin-bottom:4px; opacity:0.8;">ID: ${s.id} (${s.tokens} tok)</div>
+                    <div>${s.content}</div>
                 </div>`;
             });
         }
         if (data.all_tail_msgs && data.all_tail_msgs.length > 0) {
-          ctxHtml += `<div class="card" style="border-style: dashed; border-color: var(--green);">
-              <div style="color:var(--green); font-weight:700; font-size:11px; margin-bottom:4px;">FRESH TAIL (Protected)</div>
-              <div class="msg-history">${data.all_tail_msgs.join('<br><br>')}</div>
-          </div>`;
+            data.all_tail_msgs.forEach(m => {
+                const isUser = m.role === 'user';
+                ctxHtml += `<div class="bubble ${isUser ? 'bubble-user' : 'bubble-ai'}">
+                    <div class="bubble-role">${isUser ? 'User' : 'AI'}</div>
+                    <div>${m.content}</div>
+                </div>`;
+            });
         }
         const scroller = document.getElementById('context-scroller');
         

@@ -28,11 +28,19 @@ main {
     display: flex; justify-content: space-between; align-items: center; z-index: 10;
 }
 
-/* CONTEXT WINDOW: Tăng khoảng thở, dễ đọc text dài */
-.scroller { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-.card { background: var(--bg-panel); border: 1px solid var(--border-panel); border-radius: 8px; padding: 16px; font-size: 13px; line-height: 1.6; }
-.summary-card { border-left: 4px solid var(--color-d1); }
-.msg-history { font-size: 12px; color: var(--text-muted); margin-top: 12px; border-top: 1px dashed #30363d; padding-top: 12px; white-space: pre-wrap; }
+/* CONTEXT WINDOW: Chat-style bubbles */
+.scroller { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.bubble { max-width: 85%; padding: 12px 16px; border-radius: 12px; font-size: 13px; line-height: 1.5; position: relative; }
+.bubble-user { align-self: flex-end; background: #0b3d91; color: #fff; border-bottom-right-radius: 2px; border: 1px solid #1a5fb4; }
+.bubble-ai { align-self: flex-start; background: #21262d; color: var(--text-main); border-bottom-left-radius: 2px; border: 1px solid var(--border-panel); }
+.bubble-role { font-size: 9px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; opacity: 0.7; letter-spacing: 0.5px; }
+
+.summary-capsule { 
+    background: rgba(210, 153, 34, 0.05); border: 1px solid rgba(210, 153, 34, 0.3); 
+    border-radius: 8px; padding: 12px; font-size: 12px; color: var(--text-muted); 
+    border-left: 4px solid var(--orange); position: relative;
+}
+.summary-capsule::before { content: '◈ MEMORY'; position: absolute; top: -8px; left: 10px; background: var(--bg-body); padding: 0 6px; font-size: 9px; font-weight: 800; color: var(--orange); }
 
 /* DAG TREE: Trả lại nét đứt cam cho D0, giãn cách các Node rộng ra */
 #dag-viewport { flex: 1; overflow: hidden; position: relative; background: #010409; cursor: grab; }

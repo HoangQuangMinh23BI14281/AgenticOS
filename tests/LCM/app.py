@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -54,18 +55,78 @@ async def handle_chat(req: ChatRequest):
     ai_text = ai_res.content[0].text if (ai_res.content and hasattr(ai_res.content[0], 'text')) else (
         ai_res.content[0] if (ai_res.content and isinstance(ai_res.content[0], str)) else "[OLLAMA CONNECTION FAILED]"
     )
-    if "</think>" in ai_text: 
-        ai_text = ai_text.split("</think>")[-1].strip()
+    # No stripping for now, to see everything
+    # if "</think>" in ai_text: 
+    #     ai_text = ai_text.split("</think>")[-1].strip()
     
     # 3. Ingest AI Response
     engine.ingest_message(session_id, MessageRole.ASSISTANT, [{"text": ai_text}])
     
-    # 4. Check maintenance
+    # 4. Check maintenance (use standardized role names for UI)
+    role_standard = "assistant"
     conv = engine.conversations.get_conversation_by_session_id(session_id)
     if conv and engine.summaries.get_context_token_count(conv.conversation_id) > state["threshold"]:
         await engine.run_maintenance(session_id, context_budget=state["budget"])
     
     return {"status": "ok", "response": ai_text}
+
+@app.post("/v1/chat/completions")
+async def openai_completions(req: dict):
+    # Mock OpenAI response for qwen_agent and other libraries
+    messages = req.get("messages", [])
+    if not messages: return {"error": "No messages"}
+    
+    session_id = state["session_id"]
+    conv = engine.conversations.get_or_create_conversation(session_id)
+    
+    # Lấy số lượng tin nhắn hiện tại trong DB để so sánh
+    existing_count = engine.conversations.get_message_count(conv.conversation_id)
+    
+    # Chỉ ingest những tin nhắn "mới" từ cuối danh sách messages
+    # Đây là logic đơn giản: nếu messages dài hơn DB, ta lấy phần đuôi
+    new_messages = []
+    if len(messages) > existing_count:
+        new_messages = messages[existing_count:]
+        
+    for m in new_messages:
+        role_map = {
+            "user": MessageRole.USER,
+            "assistant": MessageRole.ASSISTANT,
+            "system": MessageRole.SYSTEM,
+            "tool": MessageRole.ASSISTANT # Coi Tool là một phần phản hồi
+        }
+        role = role_map.get(m["role"], MessageRole.USER)
+        engine.ingest_message(session_id, role, [{"text": str(m["content"])}])
+
+    # Assemble context từ LCM (Lúc này đã bao gồm cả các tin cũ được nén)
+    ctx = engine.assemble(session_id, context_budget=state["budget"])
+    
+    # Lấy câu hỏi cuối cùng để LLM tập trung trả lời
+    last_query = messages[-1]["content"] if messages[-1]["role"] == "user" else "Continue the conversation based on history."
+    
+    ai_res = await cmpl.complete(
+        messages=[{"role": "user", "content": f"{ctx}\n\nUser: {last_query}"}], 
+        max_tokens=4096
+    )
+    
+    ai_text = ai_res.content[0].text if (ai_res.content and hasattr(ai_res.content[0], 'text')) else (
+        ai_res.content[0] if (ai_res.content and isinstance(ai_res.content[0], str)) else ""
+    )
+    
+    # Note: Chúng ta không ingest ai_text ở đây, vLLM/OpenAI client sẽ gửi lại nó ở round tiếp theo
+    # để mình ingest đồng nhất.
+    
+    return {
+        "id": f"chatcmpl-{uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": 123456789,
+        "model": "qwen3.5:2b",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": ai_text},
+            "finish_reason": "stop"
+        }]
+    }
 
 @app.get("/grep")
 def grep_tool(q: str):
@@ -122,8 +183,8 @@ async def sse_stream():
                         if m: 
                             payload["tail_msgs"] += 1
                             payload["tail_tokens"] += m.token_count
-                            role = "USER" if m.role.value == "user" else "AI"
-                            payload["all_tail_msgs"].append(f"<b>[{role}]</b>: {m.content}")
+                            role = "user" if m.role.value == "user" else "ai"
+                            payload["all_tail_msgs"].append({"role": role, "content": m.content})
                     else:
                         s = engine.summaries.get_summary(i.summary_id)
                         if s: 

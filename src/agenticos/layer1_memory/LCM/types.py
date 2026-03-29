@@ -77,6 +77,22 @@ class TokenizerProtocol(Protocol):
         ...
 
 
+class TransformersTokenizer(TokenizerProtocol):
+    """
+    Real-world tokenizer implementation using the Hugging Face transformers library.
+    """
+
+    def __init__(self, model_name: str = "gpt2"):
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    def encode(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text)
+
+    def decode(self, tokens: list[int]) -> str:
+        return self._tokenizer.decode(tokens)
+
+
 @runtime_checkable
 class CompleteFn(Protocol):
     """

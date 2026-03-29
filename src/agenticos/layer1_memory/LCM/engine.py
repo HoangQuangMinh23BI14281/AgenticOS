@@ -177,9 +177,10 @@ class LcmEngine:
         history_pieces = []
         
         if bindles:
-            history_pieces.append("--- PREVIOUS CONTEXT SUMMARIES ---")
+            history_pieces.append("--- ACTIVE MEMORY SUMMARIES ---")
+            history_pieces.append("The following are condensed summaries of older conversations. Use 'lcm_expand' if you need details.")
             for b in bindles:
-                history_pieces.append(f"[Summary Depth {b.depth}]: {b.content}")
+                history_pieces.append(f"[SUMMARY D{b.depth} | ID: {b.summary_id}]: {b.content}")
             history_pieces.append("--- END SUMMARIES ---")
 
         if messages:
@@ -187,8 +188,10 @@ class LcmEngine:
                 history_pieces.append(f"{msg.role.value.capitalize()}: {msg.content}")
 
         history_text = "\n\n".join(history_pieces)
-
-        return f"{header}\n\n<context_history>\n{history_text}\n</context_history>"
+        full_ctx = f"{header}\n\n<context_history>\n{history_text}\n</context_history>"
+        
+        logger.debug(f"[lcm] Assembled context for {session_id}:\n{full_ctx}")
+        return full_ctx
 
     def _build_metadata_hooks(self, bindles: list) -> str:
         """
@@ -205,17 +208,20 @@ class LcmEngine:
         xml = ["<lcm_metadata>"]
         xml.append("  <active_summaries> <!-- 'Bindles' currently in RAM -->")
         for b in bindles:
+            snippet = b.content[:60].replace("\n", " ") + "..."
             xml.append(
-                f'    <summary id="{b.summary_id}" depth="{b.depth}" '
-                f'tokens="{b.token_count}">Depth {b.depth} condensed memory</summary>'
+                f'    <summary id="{b.summary_id}" depth="{b.depth}" tokens="{b.token_count}" '
+                f'topic="{snippet}">Depth {b.depth} condensed memory</summary>'
             )
         xml.append("  </active_summaries>")
         xml.append(
-            "  <instruction>"
-            "If you need deeper historical details from older summaries "
-            "(Archive Stubs) that are no longer in active context, "
-            "use the `lcm_expand` or `lcm_describe` tools."
-            "</instruction>"
+            "  <instruction>\n"
+            "    You are an agent with LCM (Lossless Context Management) memory.\n"
+            "    Active memories (summaries) are provided below in the <context_history> block.\n"
+            "    CRITICAL: If you encounter a [SUMMARY] node and need deeper historical details,\n"
+            "    you MUST call `lcm_expand(item_id=...)` to retrieve the original lossless data.\n"
+            "    Do not hallucinate details that are not explicitly in the summary; use your tools.\n"
+            "  </instruction>"
         )
         xml.append("</lcm_metadata>")
 

@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass
 from uuid import uuid4
 
-from .types import CompactionDecision, CompactionResult, SummaryKind, ContextItemType
+from .types import CompactionDecision, CompactionResult, SummaryKind, ContextItemType, MessageRole
 from .config import LcmConfig
 from .store import ConversationStore, SummaryStore
 from .summarize import LcmSummarizer
@@ -191,21 +191,19 @@ class CompactionEngine:
                 else:
                     made_progress = False
 
-        # Level 3: Deterministic tail truncation (not LLM-summary based)
-        # In a real node impl, this would blindly delete context items from the top
-        # until budget is satisfied. For now, log warning if we couldn't converge.
+        # Level 3: Deterministic truncation (Level 3 - Guaranteed Convergence)
         if state.current_tokens > state.target_budget:
-            logger.error(
-                "[lcm] convergence failure after %d rounds! "
-                "Context (%d) exceeds soft limit (%d). "
-                "Deterministic truncation required.",
-                state.rounds, state.current_tokens, state.target_budget
-            )
-        else:
+            logger.warning("[lcm] escalation: level 3 (deterministic truncate)")
+            await self._deterministic_truncate(conversation_id, state.target_budget)
+            state.current_tokens = self._summary_store.get_context_token_count(conversation_id)
+
+        if state.current_tokens <= state.target_budget:
             logger.info(
                 "[lcm] compaction clear after %d rounds. Context %d <= %d threshold.",
                 state.rounds, state.current_tokens, state.target_budget
             )
+        else:
+             logger.error("[lcm] compaction failed to reach target after all escalations")
 
         # Clear LRU cache post-compaction
         if results:
@@ -227,30 +225,28 @@ class CompactionEngine:
                 if chunk: break
                 
         # =========================================================
-        # FIX 1: BẢO VỆ ĐUÔI TỐI THƯỢNG (ABSOLUTE TAIL PROTECTION)
+        # FIX 1-2: MASSIVE COMPACTION & QA PROTECTION (Paper Logic)
         # =========================================================
         is_at_tail = (start_idx + len(chunk) == len(items))
         
         if is_at_tail:
-            # Normal: Giữ 4 tin nhắn. Aggressive (Sắp tràn RAM): BẮT BUỘC giữ ít nhất 1 tin nhắn.
-            tail_keep = 1 if aggressive else 4
+            # Giữ lại đúng 6 tin nhắn (tương đương 3 cặp Hỏi-Đáp) làm Fresh Tail
+            tail_keep = 6
+            
+            # Đảm bảo không nén dở dang cặp (Hỏi - Đáp)
+            if len(chunk) > tail_keep:
+                last_msg_in_chunk = self._conv_store.get_message_by_id(chunk[-1].message_id)
+                if last_msg_in_chunk and last_msg_in_chunk.role == MessageRole.USER:
+                    tail_keep += 1 # Đẩy USER sang vùng Fresh
             
             if len(chunk) > tail_keep:
                 chunk = chunk[:-tail_keep]
             else:
-                # Trả về None: Thà không nén được còn hơn là xóa mất Fresh Tail của User
                 return None
 
+        # Bỏ giới hạn GROUP_SIZE để gom toàn bộ "đống rác" phía trước
         # =========================================================
-        # FIX 2: ÉP CẤU TRÚC DAG (Chỉ gộp tối đa 4 node 1 lúc)
-        # =========================================================
-        GROUP_SIZE = 4
-        if len(chunk) > GROUP_SIZE:
-            chunk = chunk[:GROUP_SIZE]
-
-        # =========================================================
-        # FIX 3: CHỐNG NÉN 1-TO-1 (VÔ NGHĨA VÀ GÂY MẤT DỮ LIỆU)
-        # =========================================================
+        
         if len(chunk) < 2:
             return None
             
@@ -286,6 +282,15 @@ class CompactionEngine:
             depth=0,
             source_message_token_count=total_source_tokens
         )
+        
+        # Stricter Compression Guard
+        if token_count >= total_source_tokens * 0.9 and not aggressive:
+            logger.warning(
+                "[lcm] poor compression in leaf pass (%d -> %d). "
+                "Retrying with aggressive mode in next round.",
+                total_source_tokens, token_count
+            )
+        
         self._summary_store.link_to_messages(summary_id, message_ids)
         
         self._summary_store.replace_context_range_with_summary(
@@ -320,7 +325,7 @@ class CompactionEngine:
                     chunk.append((item, s))
                 else:
                     # Đụng độ sâu khác. Nếu chunk trước đó đã đủ lớn thì dừng lại để nén
-                    if len(chunk) >= (2 if aggressive else 4):
+                    if len(chunk) >= (3 if aggressive else 4):
                         break
                     # Nếu chưa đủ lớn, đập đi xây lại chunk mới từ item này
                     chunk = [(item, s)]
@@ -328,7 +333,7 @@ class CompactionEngine:
                     target_depth = s.depth
             else:
                 # Đụng phải tin nhắn thô (Message), ngắt chuỗi
-                if len(chunk) >= (2 if aggressive else 4):
+                if len(chunk) >= (3 if aggressive else 4):
                     break
                 chunk = []
                 start_idx = -1
@@ -338,7 +343,7 @@ class CompactionEngine:
         if len(chunk) > GROUP_SIZE:
             chunk = chunk[:GROUP_SIZE]
 
-        if len(chunk) < (2 if aggressive else GROUP_SIZE):
+        if len(chunk) < (3 if aggressive else GROUP_SIZE):
             return None
             
         summary_ids = []
@@ -376,6 +381,13 @@ class CompactionEngine:
             source_message_token_count=total_source_tokens
         )
         
+        # Stricter Compression Guard (Condensed)
+        if token_count >= total_source_tokens * 0.9 and not aggressive:
+             logger.warning(
+                "[lcm] poor compression in condensed pass (%d -> %d).",
+                total_source_tokens, token_count
+            )
+        
         self._summary_store.link_to_parents(summary_id, summary_ids)
         
         self._summary_store.replace_context_range_with_summary(
@@ -386,3 +398,28 @@ class CompactionEngine:
         )
         
         return summary_id
+
+    async def _deterministic_truncate(self, conv_id: int, target_budget: int) -> None:
+        """
+        Level 3 Fallback: Blindly remove the oldest context items until under budget.
+        Does not delete messages from DB, only from active Context Window.
+        """
+        items = self._summary_store.get_context_items(conv_id)
+        current = self._summary_store.get_context_token_count(conv_id)
+        
+        removed_count = 0
+        for item in items:
+            if current <= target_budget:
+                break
+            
+            # Xóa item cũ nhất (truy cập pool nội bộ của summary_store)
+            self._summary_store._pool.execute_write(lambda conn: conn.execute(
+                "DELETE FROM context_items WHERE conversation_id = ? AND ordinal = ?",
+                (conv_id, item.ordinal)
+            ))
+            
+            # Cập nhật dự đoán token
+            current = self._summary_store.get_context_token_count(conv_id)
+            removed_count += 1
+            
+        logger.info(f"[lcm] level 3: removed {removed_count} items to meet hard budget")

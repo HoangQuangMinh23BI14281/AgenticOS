@@ -24,7 +24,7 @@ logger = logging.getLogger("lcm.summarize")
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 DEFAULT_CONDENSED_TARGET_TOKENS = 2_000
-SUMMARIZER_TIMEOUT_S = 60.0
+SUMMARIZER_TIMEOUT_S = 180.0
 SYSTEM_PROMPT = (
     "You are a context-compaction summarization engine. "
     "Follow user instructions exactly and return plain text summary content only."
@@ -114,21 +114,20 @@ def build_leaf_prompt(
     )
 
     return "\n\n".join([
-        "You summarize a SEGMENT of a conversation for future model turns.",
-        "Treat this as incremental memory compaction input, not a full-conversation summary.",
+        "You summarize a list of messages. Output ONLY the factual summary content.",
+        "CRITICAL: DO NOT include prefixes like 'User:', 'Assistant:', or 'AI:' in your response.",
+        "Your output must be a pure third-party narrative of the events or topics discussed.",
         policy,
         instr,
         (
             "Output requirements:\n"
-            "- Plain text only.\n"
+            "- Plain text only. No roles, no markers, no 'User says'.\n"
             "- No preamble, headings, or markdown formatting.\n"
-            "- Keep it concise while preserving required details.\n"
-            "- Track file operations (created, modified, deleted, renamed) with file paths and current status.\n"
+            "- Track file operations (created, modified, deleted, renamed) with paths.\n"
             '- If no file operations appear, include exactly: "Files: none".\n'
-            '- End with exactly: "Expand for details about: <comma-separated list of what was dropped or compressed>".\n'
+            '- End with exactly: "Expand for details about: <comma-separated list>".\n'
             f"- Target length: about {target_tokens} tokens or less."
         ),
-        f"<previous_context>\n{prev_ctx}\n</previous_context>",
         f"<conversation_segment>\n{text}\n</conversation_segment>",
     ])
 
@@ -240,6 +239,30 @@ def build_d3plus_prompt(
     ])
 
 
+def build_expansion_prompt(
+    text: str,
+    query: str,
+    custom_instructions: str | None = None,
+) -> str:
+    """Build expansion prompt for high-fidelity retrieval."""
+    instr = f"Operator instructions:\n{custom_instructions.strip()}" if custom_instructions and custom_instructions.strip() else ""
+    
+    return "\n\n".join([
+        "You are an information retrieval agent.",
+        f"The user is asking: '{query}'",
+        "Based on the RAW conversation logs provided below, provide a DIRECT and DETAILED answer.",
+        "Do not summarize if the detail is relevant to the query. Keep facts verbatim.",
+        instr,
+        (
+            "Output requirements:\n"
+            "- Plain text only.\n"
+            "- No 'Expand for details about' footers.\n"
+            "- Focus 100% on the user's query."
+        ),
+        f"<raw_logs>\n{text}\n</raw_logs>",
+    ])
+
+
 def build_condensed_prompt(
     text: str,
     target_tokens: int,
@@ -275,57 +298,45 @@ def deterministic_fallback_summary(text: str, max_tokens: int = 512) -> str:
 
 
 def normalize_completion_summary(content: Any) -> str:
-    """Extract text safely from provider completion response."""
+    """Extract text safely from provider completion response (supports LiteLLM/OpenAI/Anthropic)."""
     if isinstance(content, str):
         return content.strip()
     
+    # Check for .text attribute (CompletionResult or similar)
     if hasattr(content, "text"):
         return str(content.text).strip()
-        
+    
+    # Handle list of blocks (CompletionContentBlock)
     if isinstance(content, list) and len(content) > 0:
-        first_item = content[0]
-        if hasattr(first_item, "text"):
-            return str(first_item.text).strip()
-        if isinstance(first_item, str):
-            return first_item.strip()
+        parts = []
+        for item in content:
+            if hasattr(item, "text"): parts.append(str(item.text))
+            elif isinstance(item, str): parts.append(item)
+        return "\n".join(parts).strip()
             
     if isinstance(content, dict):
         for key in ["text", "content", "summary", "response"]:
             if key in content and isinstance(content[key], str):
                 return content[key].strip()
 
-    return str(content).strip()
-
-
-def _collect_text(value: Any, out: list[str]) -> None:
-    """Recursively collect text fields from provider response."""
-    if isinstance(value, str):
-        out.append(value)
-        return
-    if isinstance(value, list):
-        for item in value:
-            _collect_text(item, out)
-        return
-    if not isinstance(value, dict):
-        return
-    for key in ("text", "output_text", "thinking"):
-        v = value.get(key)
-        if isinstance(v, str):
-            out.append(v)
-        elif isinstance(v, list):
-            for item in v:
-                _collect_text(item, out)
-    for key in ("content", "summary", "output", "message", "response"):
-        if key in value:
-            _collect_text(value[key], out)
+    # Strip common prompt leaks and role prefixes (Aggressive Cleaning)
+    res = re.sub(r"<(/?)(previous_context|conversation_segment|conversation_to_condense|raw_logs)>", "", res, flags=re.I)
+    res = re.sub(r"\*\*?(User|Assistant|AI|System|Thinking)\*\*?[:\s-]*", "", res, flags=re.I)
+    res = re.sub(r"^(User|Assistant|AI|System|Thinking)[:\s-]*", "", res, flags=re.I, count=0)
+    res = re.sub(r"\n(User|Assistant|AI|System|Thinking)[:\s-]*", "\n", res, flags=re.I)
+    res = re.sub(r"\[/?(previous_context|summary|context_history)\]", "", res, flags=re.I)
+    
+    # Remove any thinking block that might have leaked into content
+    if "<think>" in res.lower():
+        res = re.sub(r"<think>.*?</think>", "", res, flags=re.I | re.DOTALL)
+    
+    return res.strip()
 
 
 def detect_provider_auth_failure(error: Any) -> bool:
     """Check if an error looks like a provider auth failure."""
-    text_parts: list[str] = []
-    _collect_text(error if isinstance(error, dict) else str(error), text_parts)
-    combined = " ".join(text_parts)
-    return bool(AUTH_ERROR_PATTERN.search(combined))
+    err_str = str(error).lower()
+    return bool(AUTH_ERROR_PATTERN.search(err_str))
 
 
 # ── Summarizer ────────────────────────────────────────────────────────────────
@@ -370,23 +381,46 @@ class LcmSummarizer:
         # Ưu tiên custom_instructions được truyền vào (dùng cho Expand Query)
         instr = custom_instructions if custom_instructions else self._custom_instructions
 
+    async def summarize(
+        self,
+        text: str,
+        aggressive: bool = False,
+        previous_summary: str | None = None,
+        is_condensed: bool = False,
+        depth: int = 0,
+        custom_instructions: str | None = None, # Thêm tham số này để Expand Tool dùng được
+        mode: str = "summary", # "summary" | "expansion"
+        query: str = ""
+    ) -> str:
+        """
+        Summarize or Expand text using LLM with appropriate prompt.
+        """
+        # Ưu tiên custom_instructions được truyền vào (dùng cho Expand Query)
+        instr = custom_instructions if custom_instructions else self._custom_instructions
+
         input_tokens = estimate_tokens_fallback(text)
-        target_tokens = resolve_target_tokens(
-            input_tokens, aggressive, is_condensed
-        )
-
-        if is_condensed:
-            prompt = build_condensed_prompt(
-                text, target_tokens, depth,
-                previous_summary, instr,
-            )
+        
+        if mode == "expansion":
+            prompt = build_expansion_prompt(text, query, instr)
+            system = "You are a high-fidelity retrieval agent. Answer questions accurately based on logs."
+            target_tokens = 2048 # High budget for expansion
         else:
-            prompt = build_leaf_prompt(
-                text, target_tokens, aggressive,
-                previous_summary, instr,
+            target_tokens = resolve_target_tokens(
+                input_tokens, aggressive, is_condensed
             )
+            system = SYSTEM_PROMPT
+            if is_condensed:
+                prompt = build_condensed_prompt(
+                    text, target_tokens, depth,
+                    previous_summary, instr,
+                )
+            else:
+                prompt = build_leaf_prompt(
+                    text, target_tokens, aggressive,
+                    previous_summary, instr,
+                )
 
-        label = f"{'condensed' if is_condensed else 'leaf'} d={depth}"
+        label = f"{mode} {'condensed' if is_condensed else 'leaf'} d={depth}"
         
         # In log ra để bạn biết LLM đang được gọi bằng Prompt gì!
         logger.debug(f"[lcm] Calling LLM for {label} - Target: {target_tokens} tok")
@@ -397,7 +431,7 @@ class LcmSummarizer:
                     model=self._model,
                     # Chú ý: Cấu trúc messages chuẩn của API
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": system},
                         {"role": "user", "content": prompt}
                     ],
                     max_tokens=max(target_tokens * 2, 2048),

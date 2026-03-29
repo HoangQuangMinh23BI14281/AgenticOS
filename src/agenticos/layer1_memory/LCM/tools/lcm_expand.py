@@ -57,19 +57,25 @@ async def run_lcm_expand(
     if not nodes:
         return f"No data found under {item_id}"
         
-    block = [f"Subtree logs for {item_id}:"]
+    block = []
+    total_tokens = 0
     for node in nodes:
         block.append(f"[{node.summary_id}]: {node.content}")
+        total_tokens += node.token_count
         
     full_text = "\n".join(block)
     
-    # Fallback query
-    # Try if it has summarize method (like LcmSummarizer)
+    # Nếu dữ liệu nhỏ (< budget), trả về RAW luôn cho sướng!
+    if total_tokens <= budget:
+        return f"[Verbatim Expansion]:\n{full_text}"
+
+    # Nếu dữ liệu lớn, dùng LLM để lọc đúng thứ người dùng cần (High Fidelity)
     if hasattr(summarizer_or_dispatcher, "summarize"):
         answer = await summarizer_or_dispatcher.summarize(
-            f"Query: {query}\nLogs:\n{full_text}", 
-            aggressive=True
+            text=full_text,
+            mode="expansion",
+            query=query
         )
     else:
         answer = "[Error: No summarizer provided for fallback retrieval]"
-    return f"[Fallback Retrieval]:\n{answer}"
+    return f"[Fidelity Expansion]:\n{answer}"

@@ -10,7 +10,7 @@ class SimpleTokenizer(TokenizerProtocol):
         return ""
 
 class OllamaCompleter:
-    def __init__(self, model: str = "deepseek-r1:1.5b", base_url: str = "http://localhost:11434"):
+    def __init__(self, model: str = "qwen3.5:2b", base_url: str = "http://localhost:11434"):
         self.model = model
         self.base_url = f"{base_url}/api/chat"
         self.status_url = f"{base_url}/api/tags"
@@ -41,12 +41,20 @@ class OllamaCompleter:
             "options": {"num_predict": max_tokens, "temperature": temperature or 0.7}
         }
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 response = await client.post(self.base_url, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                content = data.get("message", {}).get("content", "")
-                return CompletionResult(content=[CompletionContentBlock(type="text", text=content)])
+                message = data.get("message", {})
+                content = message.get("content", "")
+                thinking = message.get("thinking", "")
+                
+                # Nếu có phần suy nghĩ, ta lồng nó vào như cách Deepseek-R1 thường làm hoặc ghép lại
+                full_response = content
+                if thinking:
+                    full_response = f"<think>\n{thinking}\n</think>\n\n{content}"
+                
+                return CompletionResult(content=[CompletionContentBlock(type="text", text=full_response)])
         except Exception as e:
             print(f"[OLLAMA ERROR] {e}")
             return CompletionResult(error={"message": str(e)})

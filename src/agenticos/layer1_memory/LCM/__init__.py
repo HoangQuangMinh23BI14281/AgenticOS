@@ -16,16 +16,16 @@ from .types import (
     SummaryKind,
     SummaryRecord,
     TokenizerProtocol,
+    TransformersTokenizer,
 )
-from .node import LcmNode
 
 __all__ = [
     "LcmConfig",
     "resolve_lcm_config",
     "LcmEngine",
-    "LcmNode",
     "LcmDependencies",
     "TokenizerProtocol",
+    "TransformersTokenizer",
     "CompleteFn",
     "CompletionContentBlock",
     "CompletionResult",
