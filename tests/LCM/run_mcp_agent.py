@@ -86,14 +86,27 @@ async def main():
     full_content = await mcp.call_tool("lcm_expand", {"item_id": target_id, "query": "Harry Potter"})
     print(f"[Observation] Expanded Content (first 100 chars): {full_content[:100]}...")
 
-    # 4. Final response using all gathered context
-    prompt = (
-        f"Context from Memory Server:\n"
-        f"- Search Results: {search_results[:200]}...\n"
-        f"- Metadata for {target_id}: {metadata}\n"
-        f"- Original Details: {full_content[:500]}...\n\n"
-        f"User Question: {user_query}"
-    )
+    # 4. Final response using all gathered context (Prompt Dressing & Guardrails)
+    prompt = f"""
+Bạn là một trợ lý AI thông minh đang truy xuất thông tin từ hệ thống Lossless Context Management (LCM).
+
+--- DỮ LIỆU ĐÃ TRUY XUẤT ---
+Nội dung chi tiết (Từ Memory Node {target_id}):
+{full_content}
+
+Thông tin bổ sung (Lưu ý cho AI, không nói lại với user):
+- Đây là dữ liệu gốc (không phải tóm tắt).
+- Độ dài: {len(full_content) // 4} tokens (ước tính).
+-----------------------------
+
+CÂU HỎI CỦA NGƯỜI DÙNG: 
+{user_query}
+
+CHỈ THỊ QUAN TRỌNG:
+1. TRỰC TIẾP trả lời câu hỏi của người dùng dựa trên "Nội dung chi tiết" ở trên.
+2. KHÔNG BAO GIỜ liệt kê, giải thích hay nhắc đến các thông số kỹ thuật (như id, depth, srcTok, child_manifest, metadata). Người dùng không cần biết hệ thống nội bộ hoạt động ra sao.
+3. Nếu dữ liệu quá ngắn, hãy tóm tắt những gì bạn thấy và nói rõ là dữ liệu chỉ có đến vậy, không suy diễn thêm (ví dụ: không suy diễn tác giả).
+"""
     messages = [{"role": "user", "content": prompt}]
     
     print("\n[Agent] Final Thinking...")

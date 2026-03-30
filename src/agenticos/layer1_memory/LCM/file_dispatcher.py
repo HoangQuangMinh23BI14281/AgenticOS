@@ -12,7 +12,8 @@ from uuid import uuid4
 
 from .config import LcmConfig
 from .store import ConversationStore, SummaryStore
-from .summarize import LcmSummarizer, estimate_tokens_fallback
+from .summarize import LcmSummarizer
+from .tokenizer_util import LcmSimpleTokenizer
 
 logger = logging.getLogger("lcm.file_dispatcher")
 
@@ -92,7 +93,7 @@ class FileDispatcher:
             )
             
             # Update the DB via official Store method
-            new_tokens = estimate_tokens_fallback(new_content)
+            new_tokens = len(LcmSimpleTokenizer().encode(new_content))
             self._conv_store.update_message(msg_id, new_content, new_tokens)
             
             externalized_count += 1

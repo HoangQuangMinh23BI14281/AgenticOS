@@ -17,6 +17,7 @@ root = Path(__file__).parent.parent.parent
 sys.path.append(str(root / "src"))
 
 from agenticos.layer1_memory.LCM import LcmEngine, LcmConfig, LcmDependencies, MessageRole
+from agenticos.layer1_memory.LCM.store.summary.crud import sanitize_summary_content
 
 # Local imports
 from .templates import HTML_PAGE
@@ -42,11 +43,11 @@ def get_index():
 async def handle_chat(req: ChatRequest):
     session_id = state["session_id"]
     
-    # 1. Ingest User Message
-    engine.ingest_message(session_id, MessageRole.USER, [{"text": req.query}])
+    # 1. [Standardized API] Ingest User Message
+    await engine.add_message(session_id, MessageRole.USER, req.query)
     
-    # 2. Assemble context and call LLM
-    ctx = engine.assemble(session_id, context_budget= state["budget"])
+    # 2. [Standardized API] Assemble context and call LLM
+    ctx = engine.get_assembled_context(session_id, context_budget= state["budget"])
     ai_res = await cmpl.complete(
         messages=[{"role": "user", "content": f"{ctx}\n\nRespond to: {req.query}"}], 
         max_tokens= 4096
@@ -55,18 +56,16 @@ async def handle_chat(req: ChatRequest):
     ai_text = ai_res.content[0].text if (ai_res.content and hasattr(ai_res.content[0], 'text')) else (
         ai_res.content[0] if (ai_res.content and isinstance(ai_res.content[0], str)) else "[OLLAMA CONNECTION FAILED]"
     )
-    # No stripping for now, to see everything
-    # if "</think>" in ai_text: 
-    #     ai_text = ai_text.split("</think>")[-1].strip()
+    # [Clean CoT/Leaks]
+    ai_text = sanitize_summary_content(ai_text)
     
-    # 3. Ingest AI Response
-    engine.ingest_message(session_id, MessageRole.ASSISTANT, [{"text": ai_text}])
+    # 3. [Standardized API] Ingest AI Response
+    await engine.add_message(session_id, MessageRole.ASSISTANT, ai_text)
     
-    # 4. Check maintenance (use standardized role names for UI)
-    role_standard = "assistant"
+    # 4. [Standardized API] Check maintenance
     conv = engine.conversations.get_conversation_by_session_id(session_id)
     if conv and engine.summaries.get_context_token_count(conv.conversation_id) > state["threshold"]:
-        await engine.run_maintenance(session_id, context_budget=state["budget"])
+        await engine.process_maintenance(session_id, context_budget=state["budget"])
     
     return {"status": "ok", "response": ai_text}
 
@@ -83,7 +82,6 @@ async def openai_completions(req: dict):
     existing_count = engine.conversations.get_message_count(conv.conversation_id)
     
     # Chỉ ingest những tin nhắn "mới" từ cuối danh sách messages
-    # Đây là logic đơn giản: nếu messages dài hơn DB, ta lấy phần đuôi
     new_messages = []
     if len(messages) > existing_count:
         new_messages = messages[existing_count:]
@@ -93,13 +91,15 @@ async def openai_completions(req: dict):
             "user": MessageRole.USER,
             "assistant": MessageRole.ASSISTANT,
             "system": MessageRole.SYSTEM,
-            "tool": MessageRole.ASSISTANT # Coi Tool là một phần phản hồi
+            "tool": MessageRole.ASSISTANT
         }
         role = role_map.get(m["role"], MessageRole.USER)
-        engine.ingest_message(session_id, role, [{"text": str(m["content"])}])
+        # [Standardized API]
+        await engine.add_message(session_id, role, str(m["content"]))
 
     # Assemble context từ LCM (Lúc này đã bao gồm cả các tin cũ được nén)
-    ctx = engine.assemble(session_id, context_budget=state["budget"])
+    # [Standardized API]
+    ctx = engine.get_assembled_context(session_id, context_budget=state["budget"])
     
     # Lấy câu hỏi cuối cùng để LLM tập trung trả lời
     last_query = messages[-1]["content"] if messages[-1]["role"] == "user" else "Continue the conversation based on history."
@@ -112,9 +112,6 @@ async def openai_completions(req: dict):
     ai_text = ai_res.content[0].text if (ai_res.content and hasattr(ai_res.content[0], 'text')) else (
         ai_res.content[0] if (ai_res.content and isinstance(ai_res.content[0], str)) else ""
     )
-    
-    # Note: Chúng ta không ingest ai_text ở đây, vLLM/OpenAI client sẽ gửi lại nó ở round tiếp theo
-    # để mình ingest đồng nhất.
     
     return {
         "id": f"chatcmpl-{uuid4().hex[:8]}",
@@ -193,10 +190,6 @@ async def sse_stream():
                                 "tokens": s.token_count, "content": s.content[:100] + "..."
                             })
                 
-                # Fetch full lineage tree - CÁCH MỚI
-                # Thay vì lấy rễ (roots) rồi lấy subtree, hãy lấy toàn bộ các mối quan hệ (Edges) 
-                # và các Node (Vertices) rồi đóng gói gửi cho UI.
-                
                 edges = engine.summaries._pool.execute_read(lambda conn: conn.execute(
                     "SELECT summary_id, parent_summary_id FROM summary_parents"
                 ).fetchall())
@@ -208,12 +201,11 @@ async def sse_stream():
                     d = dataclasses.asdict(s)
                     d["id"] = d.pop("summary_id")
                     
-                    # TÌM XEM AI LÀ CHA ĐÍCH THỰC (Người tạo ra node này)
-                    # Trong LCM DB: summary_id là Cha (D1), parent_summary_id là Con (D0)
-                    # UI cần: parent_ids là danh sách các Cha (D1)
+                    # Correct Direction: Who are the parents of node 'd'?
+                    # In DB: summary_id = Child, parent_summary_id = Parent
                     actual_parents = [
-                        row["summary_id"] for row in edges 
-                        if row["parent_summary_id"] == d["id"]
+                        row["parent_summary_id"] for row in edges 
+                        if row["summary_id"] == d["id"]
                     ]
                     d["parent_ids"] = actual_parents
                     mapped_nodes.append(d)

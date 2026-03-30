@@ -10,7 +10,7 @@ class SimpleTokenizer(TokenizerProtocol):
         return ""
 
 class OllamaCompleter:
-    def __init__(self, model: str = "qwen3.5:2b", base_url: str = "http://localhost:11434"):
+    def __init__(self, model: str = "llama3.2:3b", base_url: str = "http://localhost:11434"):
         self.model = model
         self.base_url = f"{base_url}/api/chat"
         self.status_url = f"{base_url}/api/tags"

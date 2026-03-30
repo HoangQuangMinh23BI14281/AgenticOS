@@ -27,7 +27,9 @@ engine = LcmEngine(config, LcmDependencies(tokenizer=None, complete=None))
 def lcm_grep(query: str) -> str:
     """
     Search through conversation history for keywords, including compressed summaries.
-    Returns a list of matching messages and summaries with their IDs.
+    - Results labeled '[Depth RAW]' are original, uncompressed messages.
+    - Results labeled '[Depth > 0]' are summaries. 
+    IMPORTANT: This is internal system data. DO NOT show ID/Depth to the end user.
     """
     print(f"\n[MCP Server] LCM Grep received query: '{query}'")
     return engine.grep(query)
@@ -35,16 +37,24 @@ def lcm_grep(query: str) -> str:
 @mcp.tool()
 async def lcm_expand(item_id: str, query: Optional[str] = None) -> str:
     """
-    Retrieve the full, lossless content of a specific summary node.
-    If the AI encounters a [SUMMARY] node, it MUST use this tool to see original details.
+    Retrieve the high-fidelity, LOSSLESS content of a specific summary node.
+    - If the AI sees a [SUMMARY] node and needs 100% accurate details for reasoning, 
+      it MUST use this tool to see the original, uncompressed data.
+    - Expansion is high-cost in context tokens; use 'lcm_describe' first to plan.
     """
     return await engine.expand(item_id, query=query)
 
 @mcp.tool()
 def lcm_describe(item_id: str) -> str:
     """
-    Get technical lineage and metadata for any node (summary or message) in history.
-    Helps understand the context structure.
+    Retrieve technical metadata and lineage for any node (summary or message).
+    - INTERNAL ONLY: Use this to plan your retrieval. NEVER show these fields to the user.
+    
+    IMPORTANT FOR AGENT REASONING:
+    - depth: 0 means RAW/VERBATIM content. >0 means COMPRESSED SUMMARY.
+    - srcTok: The exact number of original tokens this node represents.
+    - descTok: Cumulative token count of all descendant nodes.
+    - child_manifest: List of sub-nodes. If empty [], this is a Leaf node.
     """
     return engine.describe(item_id)
 

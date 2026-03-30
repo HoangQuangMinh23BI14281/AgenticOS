@@ -2,13 +2,13 @@
 LCM Entrypoint — Exposing Engine, Types, Tools, and the core Node.
 """
 
-from .config import LcmConfig, resolve_lcm_config
+from .config import LcmConfig, resolve_lcm_config, LcmDependencies
 from .engine import LcmEngine
+from .compaction.coordinator import CompactionEngine
 from .types import (
     CompleteFn,
     CompletionContentBlock,
     CompletionResult,
-    LcmDependencies,
     MessagePartRecord,
     MessagePartType,
     MessageRecord,

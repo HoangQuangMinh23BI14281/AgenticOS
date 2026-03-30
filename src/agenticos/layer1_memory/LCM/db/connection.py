@@ -47,12 +47,12 @@ class ConnectionPool:
         self,
         db_path: str,
         max_readers: int = 4,
-        busy_timeout_ms: int = 5000,
+        busy_timeout_ms: int = 15000,
     ) -> None:
         self._db_path = db_path
         self._max_readers = max_readers
         self._busy_timeout_ms = busy_timeout_ms
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self._writer: sqlite3.Connection | None = None
         self._readers: Queue[sqlite3.Connection] = Queue(maxsize=max_readers)
         self._closed = False
@@ -64,9 +64,9 @@ class ConnectionPool:
         """Create a new SQLite connection with optimal pragmas."""
         if readonly:
             uri = f"file:{self._db_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
         else:
-            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn = sqlite3.connect(self._db_path, check_same_thread=False, isolation_level=None)
 
         # Optimal pragmas for LCM workload
         conn.execute("PRAGMA journal_mode = WAL")
@@ -147,9 +147,11 @@ class ConnectionPool:
             try:
                 result = fn(conn)
                 conn.execute("COMMIT")
+                logger.debug("[lcm.db] transaction COMMITTED")
                 return result
-            except Exception:
+            except Exception as e:
                 conn.execute("ROLLBACK")
+                logger.error("[lcm.db] transaction ROLLED BACK due to: %s", e)
                 raise
 
     @property

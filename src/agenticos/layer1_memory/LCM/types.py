@@ -14,6 +14,29 @@ from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 
+# ── Exceptions ────────────────────────────────────────────────────────────────
+
+
+class LcmProviderAuthError(Exception):
+    """Raised when the summarizer hits a provider auth failure."""
+
+    def __init__(self, provider: str, model: str, message: str = ""):
+        super().__init__(
+            f"[lcm] compaction failed: provider auth error. "
+            f"Check configured summaryProvider credentials. "
+            f"Current: {provider}/{model}. {message}"
+        )
+        self.provider = provider
+        self.model = model
+
+
+class SummarizerTimeoutError(Exception):
+    """Raised when a summarization call exceeds the timeout."""
+
+    def __init__(self, timeout_s: float, label: str):
+        super().__init__(f"[lcm] summarizer timeout after {timeout_s}s ({label})")
+
+
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 
@@ -183,6 +206,7 @@ class SummaryRecord:
     file_ids: list[str] = field(default_factory=list)
     earliest_at: datetime | None = None
     latest_at: datetime | None = None
+    is_active: bool = True
     descendant_count: int = 0
     descendant_token_count: int = 0
     source_message_token_count: int = 0
@@ -244,17 +268,4 @@ class CompactionResult:
     level: str | None = None  # "normal" | "aggressive" | "fallback"
 
 
-# ── Dependency Container ──────────────────────────────────────────────────────
 
-
-@dataclass
-class LcmDependencies:
-    """
-    Dependencies injected into the LCM engine at init time.
-
-    Replaces all direct imports from external systems.
-    """
-
-    tokenizer: TokenizerProtocol
-    complete: CompleteFn
-    logger: logging.Logger = field(default_factory=lambda: logging.getLogger("lcm"))

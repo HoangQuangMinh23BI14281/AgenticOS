@@ -10,10 +10,14 @@ Precedence (highest → lowest):
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
+from typing import Any, TYPE_CHECKING
+import logging
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from .types import TokenizerProtocol, CompleteFn
 
 
 def _env_int(key: str) -> int | None:
@@ -169,6 +173,7 @@ class LcmConfig(BaseModel):
 
     # Compaction engine
     max_rounds: int = 10
+    max_message_tokens: int = 64000
 
 
 def resolve_lcm_config(
@@ -231,4 +236,19 @@ def resolve_lcm_config(
         autocompact_disabled=_resolve("LCM_AUTOCOMPACT_DISABLED", ["autocompactDisabled"], False, _env_bool),
         timezone=(os.environ.get("TZ", "").strip() or _pc_str(pc, "timezone") or "UTC"),
         prune_heartbeat_ok=_resolve("LCM_PRUNE_HEARTBEAT_OK", ["pruneHeartbeatOk"], False, _env_bool),
+        max_message_tokens=_resolve("LCM_MAX_MESSAGE_TOKENS", ["maxMessageTokens"], 64000, _env_int),
     )
+
+
+# ── Dependency Container ──────────────────────────────────────────────────────
+
+
+@dataclass
+class LcmDependencies:
+    """
+    Dependencies injected into the LCM engine at init time.
+    Replaces all direct imports from external systems.
+    """
+    tokenizer: TokenizerProtocol | None
+    complete: Any | None
+    logger: logging.Logger = field(default_factory=lambda: logging.getLogger("lcm"))

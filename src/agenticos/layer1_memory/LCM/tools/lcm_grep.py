@@ -28,15 +28,16 @@ def run_lcm_grep(
         if conv:
             conv_id = conv.conversation_id
 
-    sum_hits = summaries.search_summaries(query, "full_text", conv_id, limit)
-    msg_hits = conversations.search_messages(query, "full_text", conv_id, limit)
+    sum_hits = summaries.search_summaries(query, mode="full_text", conversation_id=conv_id, limit=limit)
+    msg_hits = conversations.search_messages(query, mode="full_text", conversation_id=conv_id, limit=limit)
 
     results = []
     
     # Dán nhãn chuẩn hóa cho Summaries
     for hit in sum_hits:
-        depth_val = hit.get('depth', '?')
-        results.append(f"[Depth {depth_val} | {hit['summary_id']}] {hit['snippet']}")
+        rec = hit["record"]
+        depth_val = rec.depth
+        results.append(f"[Depth {depth_val} | ID: {rec.summary_id}] {rec.content}")
 
     # Dán nhãn chuẩn hóa cho Raw Messages
     for hit in msg_hits:
