@@ -53,3 +53,6 @@ WarpOS được thiết kế để tối đa hóa năng lực suy luận của c
 - **Xử lý Toán học & Biểu thức (Symbolic Mathematics):** `sympy`
 - **Ràng buộc dữ liệu tĩnh (Static Type Validation):** `pydantic`
 - **Mục tiêu Mô hình (Target Architecture):** Qwen 2.5/3.5 - 4B (hoặc các mô hình kích thước tương đương hỗ trợ kiến trúc Transformer).
+
+$env:Path = "C:\Users\ADMIN\.local\bin;$env:Path"
+$env:Path += ";$env:LOCALAPPDATA\Programs\Ollama"

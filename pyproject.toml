@@ -6,12 +6,24 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.13.0",
+    "aiosqlite>=0.22.1",
+    "cachetools>=7.0.5",
+    "datasets>=4.8.4",
+    "fastapi>=0.135.3",
+    "httpx>=0.28.1",
+    "mcp>=1.27.0",
+    "ollama>=0.6.1",
+    "pandas>=3.0.2",
     "pydantic>=2.12.5",
+    "python-dateutil>=2.9.0.post0",
+    "sse-starlette>=3.3.4",
+    "starlette>=1.0.0",
     "sympy>=1.14.0",
     "torch>=2.4.1",
     "torchaudio>=2.4.1",
     "torchvision>=0.19.1",
     "transformers>=5.3.0",
+    "uvicorn>=0.44.0",
 ]
 
 [project.optional-dependencies]
